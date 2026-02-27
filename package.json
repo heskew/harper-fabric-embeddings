@@ -1,0 +1,39 @@
+{
+  "name": "harper-fabric-embeddings",
+  "version": "0.1.0",
+  "description": "Minimal llama.cpp embedding wrapper for Harper Fabric (linux-x64). Talks directly to the native addon — no build tools, no CLI, no chat wrappers.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node --test test.js",
+    "postinstall": "node setup.js"
+  },
+  "keywords": [
+    "llama",
+    "embeddings",
+    "harper",
+    "fabric",
+    "vector"
+  ],
+  "author": "Nathan Heskew <nathan@heskew.dev> (https://heskew.dev)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/heskew/harper-fabric-embeddings"
+  },
+  "optionalDependencies": {
+    "@node-llama-cpp/linux-x64": "^3.15.1"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "index.js",
+    "setup.js",
+    "README.md",
+    "LICENSE"
+  ]
+}
