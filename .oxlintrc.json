@@ -1,0 +1,19 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"plugins": ["unicorn", "typescript", "oxc"],
+	"categories": {},
+	"rules": {
+		"no-undef": "error",
+		"no-console": "off",
+		"no-constant-condition": "off",
+		"prefer-const": "off",
+		"typescript/no-explicit-any": "off",
+		"typescript/no-var-requires": "off"
+	},
+	"env": {
+		"builtin": true,
+		"node": true,
+		"es2024": true
+	},
+	"ignorePatterns": ["dist", ".models"]
+}

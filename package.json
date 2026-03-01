@@ -1,39 +1,57 @@
 {
-  "name": "harper-fabric-embeddings",
-  "version": "0.1.0",
-  "description": "Minimal llama.cpp embedding wrapper for Harper Fabric (linux-x64). Talks directly to the native addon — no build tools, no CLI, no chat wrappers.",
-  "type": "module",
-  "main": "index.js",
-  "exports": {
-    ".": "./index.js"
-  },
-  "scripts": {
-    "test": "node --test test.js",
-    "postinstall": "node setup.js"
-  },
-  "keywords": [
-    "llama",
-    "embeddings",
-    "harper",
-    "fabric",
-    "vector"
-  ],
-  "author": "Nathan Heskew <nathan@heskew.dev> (https://heskew.dev)",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/heskew/harper-fabric-embeddings"
-  },
-  "optionalDependencies": {
-    "@node-llama-cpp/linux-x64": "^3.15.1"
-  },
-  "engines": {
-    "node": ">=22"
-  },
-  "files": [
-    "index.js",
-    "setup.js",
-    "README.md",
-    "LICENSE"
-  ]
+	"name": "harper-fabric-embeddings",
+	"version": "0.1.0",
+	"description": "Minimal llama.cpp embedding wrapper for Harper Fabric (linux-x64). Talks directly to the native addon — no build tools, no CLI, no chat wrappers.",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		}
+	},
+	"scripts": {
+		"build": "tsc",
+		"test": "npm run build && node --test test/index.test.js",
+		"test:integration": "npm run build && node scripts/test-integration.js",
+		"lint": "oxlint --deny-warnings .",
+		"lint:fix": "oxlint --deny-warnings --fix .",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"prepublishOnly": "npm run build",
+		"postinstall": "node setup.js"
+	},
+	"keywords": [
+		"llama",
+		"embeddings",
+		"harper",
+		"fabric",
+		"vector"
+	],
+	"author": "Nathan Heskew <nathan@heskew.dev> (https://heskew.dev)",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/heskew/harper-fabric-embeddings"
+	},
+	"devDependencies": {
+		"@harperdb/code-guidelines": "^0.0.6",
+		"@types/node": "^22.0.0",
+		"oxlint": "^1.31.0",
+		"prettier": "^3.7.0",
+		"typescript": "^5.7.0"
+	},
+	"optionalDependencies": {
+		"@node-llama-cpp/linux-x64": "3.17.1"
+	},
+	"engines": {
+		"node": ">=22"
+	},
+	"files": [
+		"dist",
+		"setup.js",
+		"README.md",
+		"LICENSE"
+	]
 }
