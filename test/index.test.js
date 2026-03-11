@@ -9,7 +9,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { init, embed, dimensions, dispose } from '../dist/index.js';
+import { init, embed, embedBatch, dimensions, dispose } from '../dist/index.js';
 
 // ─── Unit tests (no model needed) ──────────────────────────────────────────
 
@@ -43,6 +43,10 @@ describe('error handling', () => {
 
 	it('throws for nonexistent model file', async () => {
 		await assert.rejects(() => init({ modelPath: '/nonexistent.gguf' }), /Model file not found/);
+	});
+
+	it('embedBatch throws when not initialized', async () => {
+		await assert.rejects(() => embedBatch(['hello']), /Not initialized/);
 	});
 });
 
@@ -97,5 +101,32 @@ describe('embedding generation', { skip: !MODEL_PATH }, () => {
 		let dot = 0;
 		for (let i = 0; i < v1.length; i++) dot += v1[i] * v2[i];
 		assert.ok(dot > 0.7, `Expected similar vectors, cosine = ${dot}`);
+	});
+
+	it('handles concurrent embed() calls without crashing', async () => {
+		const texts = Array.from({ length: 15 }, (_, i) => `Concurrent test message ${i}`);
+		const results = await Promise.all(texts.map((t) => embed(t)));
+
+		assert.equal(results.length, 15);
+		for (const vec of results) {
+			assert.ok(vec.length > 0, 'Expected non-empty vector');
+			const mag = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
+			assert.ok(Math.abs(mag - 1.0) < 0.01, `Expected unit vector, magnitude = ${mag}`);
+		}
+	});
+
+	it('embedBatch returns vectors for all inputs', async () => {
+		const texts = ['First text', 'Second text', 'Third text'];
+		const results = await embedBatch(texts);
+
+		assert.equal(results.length, 3);
+		for (const vec of results) {
+			assert.ok(vec.length > 0, 'Expected non-empty vector');
+		}
+	});
+
+	it('embedBatch returns empty array for empty input', async () => {
+		const results = await embedBatch([]);
+		assert.deepEqual(results, []);
 	});
 });

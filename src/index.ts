@@ -8,13 +8,10 @@
  * ~19 MB installed (native binary only) vs ~250 MB+ for node-llama-cpp.
  */
 
-import { createRequire } from 'node:module';
 import { createWriteStream, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { rename, unlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
-
-const require = createRequire(import.meta.url);
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -111,6 +108,9 @@ let eosToken = -1;
 let disposed = false;
 let initPromise: Promise<void> | null = null;
 
+// Serial queue for embed calls — llama.cpp context is not safe for concurrent use
+let embedQueue: Promise<unknown> = Promise.resolve();
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -206,38 +206,64 @@ async function doInit(options: InitOptions): Promise<void> {
 
 /**
  * Generate an embedding vector for the given text.
+ *
+ * Calls are serialized internally — concurrent callers wait in queue
+ * rather than hitting the llama.cpp context simultaneously.
  */
-export async function embed(text: string): Promise<number[]> {
+export function embed(text: string): Promise<number[]> {
+	const result = embedQueue.then(() => {
+		assertReady();
+		return embedOne(text);
+	});
+	embedQueue = result.catch(() => {});
+	return result;
+}
+
+/**
+ * Generate embedding vectors for multiple texts.
+ *
+ * More efficient than calling embed() in a loop — texts are processed
+ * sequentially through the native context without queue overhead per item.
+ */
+export function embedBatch(texts: string[]): Promise<number[][]> {
+	const result = embedQueue.then(async () => {
+		assertReady();
+		const results: number[][] = [];
+		for (const text of texts) {
+			results.push(await embedOne(text));
+		}
+		return results;
+	});
+	embedQueue = result.catch(() => {});
+	return result;
+}
+
+function assertReady(): void {
 	if (!binding || !model || !context) {
 		throw new Error('Not initialized. Call init() first.');
 	}
 	if (disposed) {
 		throw new Error('Engine has been disposed.');
 	}
+}
 
-	// Tokenize
-	const tokens: Uint32Array = model.tokenize(text, false);
+/**
+ * Internal: generate a single embedding (must be called within the serial queue).
+ */
+async function embedOne(text: string): Promise<number[]> {
+	const tokens: Uint32Array = model!.tokenize(text, false);
 	if (tokens.length === 0) return [];
 
-	// Prepend BOS / append EOS if the model uses them
 	const input = buildTokenSequence(tokens);
+	context!.initBatch(input.length);
 
-	// Batch evaluate
-	context.initBatch(input.length);
-
-	// logitIndexes: indexes of tokens that should produce outputs
-	// For embeddings, all tokens must be marked as outputs
 	const logitIndexes = new Uint32Array(input.length);
 	for (let i = 0; i < input.length; i++) logitIndexes[i] = i;
 
-	context.addToBatch(0, 0, input, logitIndexes);
-	await context.decodeBatch();
+	context!.addToBatch(0, 0, input, logitIndexes);
+	await context!.decodeBatch();
 
-	// Extract embedding
-	const raw: Float32Array = context.getEmbedding(input.length);
-
-	// Normalize to unit vector (L2) for cosine similarity
-	return normalize(raw);
+	return normalize(context!.getEmbedding(input.length));
 }
 
 /**
@@ -386,9 +412,11 @@ export async function downloadModel(dir: string, modelName = 'nomic-embed-text')
 
 /**
  * Find the llama-addon.node binary from installed platform packages.
+ *
+ * Scans node_modules on the filesystem rather than using require.resolve,
+ * since Harper's sandbox blocks node:module.
  */
 function findAddonBinary(): string {
-	// Platform-specific package names
 	const candidates = [
 		'@node-llama-cpp/linux-x64',
 		'@node-llama-cpp/mac-arm64-metal',
@@ -396,23 +424,21 @@ function findAddonBinary(): string {
 		'@node-llama-cpp/linux-arm64',
 	];
 
-	for (const pkg of candidates) {
-		try {
-			const pkgMain = require.resolve(pkg);
-			const pkgDir = path.dirname(pkgMain);
+	const searchRoots = [
+		path.join(process.cwd(), 'node_modules'),
+		path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'node_modules'),
+	];
 
-			// Binary lives in ../bins/<folder>/llama-addon.node
-			const binsDir = path.join(pkgDir, '..', 'bins');
+	for (const nmDir of searchRoots) {
+		if (!existsSync(nmDir)) continue;
+		for (const pkg of candidates) {
+			const binsDir = path.join(nmDir, pkg, 'bins');
 			if (!existsSync(binsDir)) continue;
 
-			// Find the first directory in bins/ that contains the addon
-			const entries = readdirSync(binsDir);
-			for (const entry of entries) {
+			for (const entry of readdirSync(binsDir)) {
 				const addonPath = path.join(binsDir, entry, 'llama-addon.node');
 				if (existsSync(addonPath)) return addonPath;
 			}
-		} catch {
-			// Package not installed
 		}
 	}
 
@@ -423,27 +449,12 @@ function findAddonBinary(): string {
 }
 
 /**
- * Load the native addon with cache isolation.
+ * Load the native addon via process.dlopen.
  *
- * The require cache is cleared before and after loading so that each call
- * gets an independent instance of the native addon's global state. Without
- * this, Node.js returns the same cached binding and multiple Llama instances
- * would share (and corrupt) each other's state.
+ * Each call gets an independent instance — no require cache to worry about.
  */
 function loadAddon(addonPath: string): LlamaBinding {
-	try {
-		delete require.cache[require.resolve(addonPath)];
-	} catch {
-		// Not cached
-	}
-
-	const addon = require(addonPath) as LlamaBinding;
-
-	try {
-		delete require.cache[require.resolve(addonPath)];
-	} catch {
-		// Ignore
-	}
-
-	return addon;
+	const mod = { exports: {} } as { exports: LlamaBinding };
+	process.dlopen(mod, addonPath);
+	return mod.exports;
 }
