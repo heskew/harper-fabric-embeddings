@@ -1,6 +1,6 @@
 {
 	"name": "harper-fabric-embeddings",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Minimal llama.cpp embedding wrapper for Harper Fabric (linux-x64). Talks directly to the native addon — no build tools, no CLI, no chat wrappers.",
 	"type": "module",
 	"main": "dist/index.js",
