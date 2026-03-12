@@ -424,9 +424,13 @@ function findAddonBinary(): string {
 		'@node-llama-cpp/linux-arm64',
 	];
 
+	const moduleDir = path.dirname(new URL(import.meta.url).pathname);
 	const searchRoots = [
 		path.join(process.cwd(), 'node_modules'),
-		path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'node_modules'),
+		// Sibling packages in the same node_modules as harper-fabric-embeddings
+		path.resolve(moduleDir, '../..'),
+		// harper-fabric-embeddings own nested node_modules (hoisted installs)
+		path.resolve(moduleDir, '..', 'node_modules'),
 	];
 
 	console.log(
