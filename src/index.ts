@@ -429,15 +429,28 @@ function findAddonBinary(): string {
 		path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'node_modules'),
 	];
 
+	console.log(
+		`[harper-fabric-embeddings] findAddonBinary: cwd=${process.cwd()}, searching ${searchRoots.length} roots`
+	);
+
 	for (const nmDir of searchRoots) {
-		if (!existsSync(nmDir)) continue;
+		if (!existsSync(nmDir)) {
+			console.log(`[harper-fabric-embeddings] findAddonBinary: skip ${nmDir} (not found)`);
+			continue;
+		}
 		for (const pkg of candidates) {
 			const binsDir = path.join(nmDir, pkg, 'bins');
-			if (!existsSync(binsDir)) continue;
+			if (!existsSync(binsDir)) {
+				console.log(`[harper-fabric-embeddings] findAddonBinary: skip ${binsDir} (not found)`);
+				continue;
+			}
 
 			for (const entry of readdirSync(binsDir)) {
 				const addonPath = path.join(binsDir, entry, 'llama-addon.node');
-				if (existsSync(addonPath)) return addonPath;
+				if (existsSync(addonPath)) {
+					console.log(`[harper-fabric-embeddings] findAddonBinary: found ${addonPath}`);
+					return addonPath;
+				}
 			}
 		}
 	}
