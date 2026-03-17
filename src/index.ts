@@ -85,6 +85,66 @@ interface LlamaContext {
 	getEmbedding(tokenCount: number): Float32Array;
 }
 
+// ─── Harper sub-component plugin entry point ────────────────────────────────
+
+/**
+ * Harper plugin hook — called on each worker thread when loaded as a
+ * sub-component via `package:` in the parent's config.yaml.
+ *
+ * Reads config from scope.options, initializes the GGUF engine, and
+ * handles close/change events for cleanup and hot-reload.
+ *
+ * Config options (in parent config.yaml):
+ *   modelName   — model from the built-in registry (default: nomic-embed-text)
+ *   modelsDir   — override models directory (default: <plugin dir>/models)
+ *   contextSize — token context window size
+ *   batchSize   — batch processing size
+ *   threads     — CPU threads for inference
+ *   gpuLayers   — layers to offload to GPU (0 = CPU only)
+ *   addonPath   — override path to llama-addon.node
+ */
+export function handleApplication(scope: {
+	directory: string;
+	options: Record<string, unknown> & {
+		on(event: 'change', fn: () => void): void;
+	};
+	on(event: 'close', fn: () => void): void;
+}): void {
+	function resolveConfig(): InitOptions {
+		return {
+			modelsDir: (scope.options.modelsDir as string) || path.join(scope.directory, 'models'),
+			modelName: (scope.options.modelName as string) || 'nomic-embed-text',
+			contextSize: scope.options.contextSize as number | undefined,
+			batchSize: scope.options.batchSize as number | undefined,
+			threads: scope.options.threads as number | undefined,
+			gpuLayers: scope.options.gpuLayers as number | undefined,
+			addonPath: scope.options.addonPath as string | undefined,
+		};
+	}
+
+	// Initialize in background — don't block Harper startup
+	init(resolveConfig()).catch((err) => {
+		console.error('[harper-fabric-embeddings] Failed to initialize:', (err as Error).message);
+	});
+
+	scope.on('close', () => {
+		dispose().catch((err) => {
+			console.error('[harper-fabric-embeddings] Error during dispose:', (err as Error).message);
+		});
+	});
+
+	scope.options.on('change', () => {
+		dispose()
+			.then(() => init(resolveConfig()))
+			.catch((err) => {
+				console.error(
+					'[harper-fabric-embeddings] Failed to re-initialize after config change:',
+					(err as Error).message
+				);
+			});
+	});
+}
+
 // ─── Model registry ─────────────────────────────────────────────────────────
 
 const MODELS: Record<string, ModelConfig> = {
@@ -468,7 +528,11 @@ function findAddonBinary(): string {
 /**
  * Load the native addon via process.dlopen.
  *
- * Each call gets an independent instance — no require cache to worry about.
+ * On Linux, dlopen of the same path returns the same handle (OS deduplicates
+ * by inode), so all worker threads share the same native .so in memory.
+ * This is safe because llama.cpp stores all state in heap-allocated objects
+ * (LlamaModel, LlamaContext) rather than C++ globals — each thread operates
+ * on its own object instances through the shared native code.
  */
 function loadAddon(addonPath: string): LlamaBinding {
 	const mod = { exports: {} } as { exports: LlamaBinding };

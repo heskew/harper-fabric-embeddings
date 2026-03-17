@@ -49,6 +49,7 @@
 		"node": ">=22"
 	},
 	"files": [
+		"config.yaml",
 		"dist",
 		"setup.js",
 		"README.md",
