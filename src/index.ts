@@ -9,8 +9,9 @@
  */
 
 import { createWriteStream, existsSync, mkdirSync, readdirSync } from 'node:fs';
-import { rename, unlink } from 'node:fs/promises';
+import { open, rename, unlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -103,13 +104,13 @@ interface LlamaContext {
  *   gpuLayers   — layers to offload to GPU (0 = CPU only)
  *   addonPath   — override path to llama-addon.node
  */
-export function handleApplication(scope: {
+export async function handleApplication(scope: {
 	directory: string;
 	options: Record<string, unknown> & {
 		on(event: 'change', fn: () => void): void;
 	};
 	on(event: 'close', fn: () => void): void;
-}): void {
+}): Promise<void> {
 	function resolveConfig(): InitOptions {
 		return {
 			modelsDir: (scope.options.modelsDir as string) || path.join(scope.directory, 'models'),
@@ -122,10 +123,8 @@ export function handleApplication(scope: {
 		};
 	}
 
-	// Initialize in background — don't block Harper startup
-	init(resolveConfig()).catch((err) => {
-		console.error('[harper-fabric-embeddings] Failed to initialize:', (err as Error).message);
-	});
+	// Await init so the model is ready before Harper routes requests to this worker
+	await init(resolveConfig());
 
 	scope.on('close', () => {
 		dispose().catch((err) => {
@@ -443,31 +442,60 @@ export async function downloadModel(dir: string, modelName = 'nomic-embed-text')
 
 	mkdirSync(dir, { recursive: true });
 
-	const url = `https://huggingface.co/${config.repo}/resolve/main/${config.file}`;
 	const destPath = path.join(dir, config.file);
+
+	// Already downloaded
+	if (existsSync(destPath)) return destPath;
+
 	const tmpPath = destPath + '.downloading';
 
-	console.log(`[harper-fabric-embeddings] Downloading ${config.file} from Hugging Face...`);
-
-	const response = await fetch(url, { redirect: 'follow' });
-	if (!response.ok) {
-		throw new Error(`Download failed: ${response.status} ${response.statusText} — ${url}`);
+	// Try to exclusively create the temp file — only one worker wins
+	let lockHandle;
+	try {
+		lockHandle = await open(tmpPath, 'wx');
+	} catch {
+		// Another worker is downloading — wait for the final file
+		console.log(`[harper-fabric-embeddings] Waiting for another worker to finish downloading ${config.file}...`);
+		await waitForFile(destPath);
+		return destPath;
 	}
 
-	// Stream to disk, clean up temp file on failure
+	// We won the lock — download the model
 	try {
+		console.log(`[harper-fabric-embeddings] Downloading ${config.file} from Hugging Face...`);
+		await lockHandle.close();
+
+		const url = `https://huggingface.co/${config.repo}/resolve/main/${config.file}`;
+		const response = await fetch(url, { redirect: 'follow' });
+		if (!response.ok) {
+			throw new Error(`Download failed: ${response.status} ${response.statusText} — ${url}`);
+		}
+
 		const fileStream = createWriteStream(tmpPath);
 		await pipeline(response.body!, fileStream);
+
+		// Rename to final path (atomic on same filesystem)
+		await rename(tmpPath, destPath);
+		console.log(`[harper-fabric-embeddings] Downloaded ${config.file} to ${destPath}`);
 	} catch (err) {
 		await unlink(tmpPath).catch(() => {});
 		throw err;
 	}
 
-	// Rename to final path (atomic on same filesystem)
-	await rename(tmpPath, destPath);
-
-	console.log(`[harper-fabric-embeddings] Downloaded ${config.file} to ${destPath}`);
 	return destPath;
+}
+
+/**
+ * Poll until a file appears on disk (another worker is downloading it).
+ */
+async function waitForFile(filePath: string, timeoutMs = 300_000): Promise<void> {
+	const start = Date.now();
+	while (!existsSync(filePath)) {
+		if (Date.now() - start > timeoutMs) {
+			throw new Error(`Timed out waiting for model download: ${filePath}`);
+		}
+		await sleep(500);
+	}
 }
 
 /**

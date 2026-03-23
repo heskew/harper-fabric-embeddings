@@ -9,7 +9,11 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { init, embed, embedBatch, dimensions, dispose } from '../dist/index.js';
+import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { init, embed, embedBatch, dimensions, dispose, downloadModel, handleApplication } from '../dist/index.js';
 
 // ─── Unit tests (no model needed) ──────────────────────────────────────────
 
@@ -47,6 +51,60 @@ describe('error handling', () => {
 
 	it('embedBatch throws when not initialized', async () => {
 		await assert.rejects(() => embedBatch(['hello']), /Not initialized/);
+	});
+});
+
+describe('downloadModel', () => {
+	it('throws for unknown model name', async () => {
+		await assert.rejects(() => downloadModel('/tmp', 'nonexistent-model'), /Unknown model/);
+	});
+
+	it('returns existing path if file already downloaded', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'hfe-test-'));
+		try {
+			// Create a fake model file matching the registry filename
+			const fakeModel = join(dir, 'nomic-embed-text-v1.5.Q4_K_M.gguf');
+			writeFileSync(fakeModel, 'fake');
+
+			const result = await downloadModel(dir, 'nomic-embed-text');
+			assert.equal(result, fakeModel);
+		} finally {
+			await rm(dir, { recursive: true });
+		}
+	});
+
+	it('only one worker downloads when lock file exists', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'hfe-test-'));
+		try {
+			// Create the .downloading lock file to simulate another worker downloading
+			const lockFile = join(dir, 'nomic-embed-text-v1.5.Q4_K_M.gguf.downloading');
+			writeFileSync(lockFile, '');
+
+			// Simulate the other worker finishing by creating the final file after a delay
+			const destFile = join(dir, 'nomic-embed-text-v1.5.Q4_K_M.gguf');
+			setTimeout(() => writeFileSync(destFile, 'fake'), 600);
+
+			const result = await downloadModel(dir, 'nomic-embed-text');
+			assert.equal(result, destFile);
+		} finally {
+			await rm(dir, { recursive: true });
+		}
+	});
+});
+
+describe('handleApplication', () => {
+	it('is async and returns a promise', () => {
+		assert.equal(typeof handleApplication, 'function');
+		// Verify it returns a promise (will reject since no model, but it's a promise)
+		const scope = {
+			directory: '/nonexistent',
+			options: Object.assign({}, { on() {} }),
+			on() {},
+		};
+		const result = handleApplication(scope);
+		assert.ok(result instanceof Promise);
+		// Let it reject gracefully
+		result.catch(() => {});
 	});
 });
 
