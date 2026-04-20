@@ -127,9 +127,7 @@ export async function handleApplication(scope: {
 		// through to defaults. Fall back to direct property access if a caller
 		// passes a plain-object scope (tests, non-Harper hosts).
 		const opts =
-			typeof scope.options.getAll === 'function'
-				? scope.options.getAll()
-				: (scope.options as Record<string, unknown>);
+			typeof scope.options.getAll === 'function' ? scope.options.getAll() : (scope.options as Record<string, unknown>);
 		return {
 			modelsDir: (opts.modelsDir as string) || path.join(scope.directory, 'models'),
 			modelName: (opts.modelName as string) || 'nomic-embed-text',

@@ -53,16 +53,16 @@ await dispose();
 
 ### init(options)
 
-| Option        | Type   | Default              | Description                              |
-| ------------- | ------ | -------------------- | ---------------------------------------- |
-| `modelPath`   | string | —                    | Absolute path to a .gguf model file      |
-| `modelsDir`   | string | —                    | Directory to search/download model files |
-| `modelName`   | string | `"nomic-embed-text"` | Model name from the built-in registry    |
-| `contextSize` | number | `2048`               | Token context window size                |
+| Option        | Type   | Default              | Description                                                                                                                                                                            |
+| ------------- | ------ | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `modelPath`   | string | —                    | Absolute path to a .gguf model file                                                                                                                                                    |
+| `modelsDir`   | string | —                    | Directory to search/download model files                                                                                                                                               |
+| `modelName`   | string | `"nomic-embed-text"` | Model name from the built-in registry                                                                                                                                                  |
+| `contextSize` | number | `2048`               | Token context window size                                                                                                                                                              |
 | `batchSize`   | number | `contextSize`        | Batch size (sets both `n_batch` and `n_ubatch`). Defaults to `contextSize` so the full context window is usable; inputs longer than `batchSize` are truncated with a one-time warning. |
-| `threads`     | number | `6`                  | CPU threads for inference                |
-| `gpuLayers`   | number | `0`                  | Layers to offload to GPU (0 = CPU only)  |
-| `addonPath`   | string | —                    | Override path to `llama-addon.node`      |
+| `threads`     | number | `6`                  | CPU threads for inference                                                                                                                                                              |
+| `gpuLayers`   | number | `0`                  | Layers to offload to GPU (0 = CPU only)                                                                                                                                                |
+| `addonPath`   | string | —                    | Override path to `llama-addon.node`                                                                                                                                                    |
 
 Either `modelPath` or `modelsDir` is required.
 
