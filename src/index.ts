@@ -113,20 +113,31 @@ interface LlamaContext {
  */
 export async function handleApplication(scope: {
 	directory: string;
-	options: Record<string, unknown> & {
+	options: {
+		getAll?: () => Record<string, unknown>;
 		on(event: 'change', fn: () => void): void;
-	};
+	} & Record<string, unknown>;
 	on(event: 'close', fn: () => void): void;
 }): Promise<void> {
 	function resolveConfig(): InitOptions {
+		// Harper's `scope.options` is an OptionsWatcher (EventEmitter); config values
+		// are NOT exposed as direct properties — they live behind `.getAll()` /
+		// `.get([key])`. Without this, every config.yaml override (modelName,
+		// batchSize, contextSize, threads, gpuLayers, addonPath) silently falls
+		// through to defaults. Fall back to direct property access if a caller
+		// passes a plain-object scope (tests, non-Harper hosts).
+		const opts =
+			typeof scope.options.getAll === 'function'
+				? scope.options.getAll()
+				: (scope.options as Record<string, unknown>);
 		return {
-			modelsDir: (scope.options.modelsDir as string) || path.join(scope.directory, 'models'),
-			modelName: (scope.options.modelName as string) || 'nomic-embed-text',
-			contextSize: scope.options.contextSize as number | undefined,
-			batchSize: scope.options.batchSize as number | undefined,
-			threads: scope.options.threads as number | undefined,
-			gpuLayers: scope.options.gpuLayers as number | undefined,
-			addonPath: scope.options.addonPath as string | undefined,
+			modelsDir: (opts.modelsDir as string) || path.join(scope.directory, 'models'),
+			modelName: (opts.modelName as string) || 'nomic-embed-text',
+			contextSize: opts.contextSize as number | undefined,
+			batchSize: opts.batchSize as number | undefined,
+			threads: opts.threads as number | undefined,
+			gpuLayers: opts.gpuLayers as number | undefined,
+			addonPath: opts.addonPath as string | undefined,
 		};
 	}
 

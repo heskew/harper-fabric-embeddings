@@ -106,6 +106,29 @@ describe('handleApplication', () => {
 		// Let it reject gracefully
 		result.catch(() => {});
 	});
+
+	it('reads options via getAll() when available (Harper OptionsWatcher interface)', async () => {
+		// Harper's scope.options is an OptionsWatcher — config values live behind
+		// .getAll() / .get([key]), not direct property access. Assert the module
+		// calls getAll() to read config so it actually honors config.yaml overrides.
+		let getAllCalls = 0;
+		const scope = {
+			directory: '/nonexistent-dir-that-wont-exist',
+			options: {
+				getAll() {
+					getAllCalls++;
+					return { modelName: 'nomic-embed-text-v2-moe', modelsDir: '/nonexistent-models-dir' };
+				},
+				on() {},
+			},
+			on() {},
+		};
+		await handleApplication(scope).catch(() => {
+			// Expected to reject — we don't care about the error, only that getAll()
+			// was consulted before the failure.
+		});
+		assert.ok(getAllCalls > 0, 'Expected getAll() to be called at least once when reading config');
+	});
 });
 
 // ─── Integration tests (need MODEL_PATH env var) ───────────────────────────
