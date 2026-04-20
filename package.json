@@ -1,7 +1,7 @@
 {
 	"name": "harper-fabric-embeddings",
 	"version": "0.2.2",
-	"description": "Minimal llama.cpp embedding wrapper for Harper Fabric (linux-x64). Talks directly to the native addon — no build tools, no CLI, no chat wrappers.",
+	"description": "Minimal llama.cpp embedding wrapper for Harper Fabric. Talks directly to the native addon — no build tools, no CLI, no chat wrappers.",
 	"type": "module",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
@@ -44,7 +44,13 @@
 		"typescript": "^5.7.0"
 	},
 	"optionalDependencies": {
-		"@node-llama-cpp/linux-x64": "3.17.1"
+		"@node-llama-cpp/linux-arm64": "3.18.1",
+		"@node-llama-cpp/linux-armv7l": "3.18.1",
+		"@node-llama-cpp/linux-x64": "3.18.1",
+		"@node-llama-cpp/mac-arm64-metal": "3.18.1",
+		"@node-llama-cpp/mac-x64": "3.18.1",
+		"@node-llama-cpp/win-arm64": "3.18.1",
+		"@node-llama-cpp/win-x64": "3.18.1"
 	},
 	"engines": {
 		"node": ">=22"
