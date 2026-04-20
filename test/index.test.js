@@ -9,7 +9,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -106,6 +106,29 @@ describe('handleApplication', () => {
 		// Let it reject gracefully
 		result.catch(() => {});
 	});
+
+	it('reads options via getAll() when available (Harper OptionsWatcher interface)', async () => {
+		// Harper's scope.options is an OptionsWatcher — config values live behind
+		// .getAll() / .get([key]), not direct property access. Assert the module
+		// calls getAll() to read config so it actually honors config.yaml overrides.
+		let getAllCalls = 0;
+		const scope = {
+			directory: '/nonexistent-dir-that-wont-exist',
+			options: {
+				getAll() {
+					getAllCalls++;
+					return { modelName: 'nomic-embed-text-v2-moe', modelsDir: '/nonexistent-models-dir' };
+				},
+				on() {},
+			},
+			on() {},
+		};
+		await handleApplication(scope).catch(() => {
+			// Expected to reject — we don't care about the error, only that getAll()
+			// was consulted before the failure.
+		});
+		assert.ok(getAllCalls > 0, 'Expected getAll() to be called at least once when reading config');
+	});
 });
 
 // ─── Integration tests (need MODEL_PATH env var) ───────────────────────────
@@ -186,5 +209,42 @@ describe('embedding generation', { skip: !MODEL_PATH }, () => {
 	it('embedBatch returns empty array for empty input', async () => {
 		const results = await embedBatch([]);
 		assert.deepEqual(results, []);
+	});
+
+	it('embeds inputs longer than the default 512 n_ubatch without crashing', async () => {
+		// Natural English at ~0.3 tokens/char → ~3KB tokenizes well past the old
+		// n_ubatch default of 512. Pre-fix this triggered GGML_ASSERT and killed
+		// the host process; post-fix it embeds normally (batchSize defaults to
+		// contextSize = 2048).
+		const longText = 'The quick brown fox jumps over the lazy dog. '.repeat(70);
+		const vec = await embed(longText);
+		assert.ok(vec.length > 0, 'Expected non-empty vector for long input');
+		const mag = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
+		assert.ok(Math.abs(mag - 1.0) < 0.01, `Expected unit vector, magnitude = ${mag}`);
+	});
+});
+
+// Separate describe with its own init/dispose so we can exercise the
+// explicit-small-batchSize truncation path without tearing down the shared
+// context used by the tests above.
+describe('embedding truncation with small batchSize', { skip: !MODEL_PATH }, () => {
+	before(async () => {
+		// First dispose any init from the prior describe block's before() —
+		// node:test runs describes sequentially so the prior `after` will have
+		// already fired, but we guard anyway.
+		await dispose().catch(() => {});
+		await init({ modelPath: MODEL_PATH, addonPath: ADDON_PATH, threads: 4, batchSize: 64, contextSize: 2048 });
+	});
+
+	after(async () => {
+		await dispose();
+	});
+
+	it('truncates oversized input instead of aborting the process', async () => {
+		// 70 repetitions ≈ 600+ tokens, well over batchSize=64. Pre-fix: crash.
+		// Post-fix: truncate to 62 body tokens + BOS/EOS.
+		const longText = 'The quick brown fox jumps over the lazy dog. '.repeat(70);
+		const vec = await embed(longText);
+		assert.ok(vec.length > 0, 'Expected non-empty vector after truncation');
 	});
 });
