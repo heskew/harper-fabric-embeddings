@@ -30,7 +30,14 @@ export interface InitOptions {
 	modelName?: string;
 	/** Token context window size. */
 	contextSize?: number;
-	/** Batch processing size. */
+	/**
+	 * Batch processing size. In node-llama-cpp this sets both `n_batch` AND
+	 * `n_ubatch` on the llama.cpp context. llama.cpp's encoder asserts
+	 * `n_ubatch >= n_tokens` for every input — inputs that tokenize above
+	 * `batchSize` trigger `GGML_ASSERT` → `ggml_abort`, killing the host
+	 * process. Defaults to `contextSize` so the full context window is
+	 * usable out of the box.
+	 */
 	batchSize?: number;
 	/** CPU threads for inference. */
 	threads?: number;
@@ -164,6 +171,11 @@ let model: LlamaModel | null = null;
 let context: LlamaContext | null = null;
 let bosToken = -1;
 let eosToken = -1;
+// Effective n_ubatch the live context was created with. embedOne truncates
+// against this so oversized inputs return a (shorter) embedding instead of
+// tripping the llama.cpp GGML_ASSERT that kills the host process.
+let maxInputTokens = 0;
+let truncationWarned = false;
 let disposed = false;
 let initPromise: Promise<void> | null = null;
 
@@ -200,11 +212,17 @@ async function doInit(options: InitOptions): Promise<void> {
 		modelsDir,
 		modelName = 'nomic-embed-text',
 		contextSize = 2048,
-		batchSize = 512,
+		batchSize: explicitBatchSize,
 		threads = 6,
 		gpuLayers = 0,
 		addonPath,
 	} = options;
+
+	// node-llama-cpp's AddonContext ties n_batch and n_ubatch to `batchSize`,
+	// and llama.cpp aborts (GGML_ASSERT -> ggml_abort, kills the host process)
+	// when any input tokenizes above n_ubatch. Default to contextSize so the
+	// full declared context window is actually embeddable.
+	const batchSize = explicitBatchSize ?? contextSize;
 
 	// Resolve model path: explicit path, or find/download in modelsDir
 	let modelPath = explicitPath;
@@ -260,6 +278,8 @@ async function doInit(options: InitOptions): Promise<void> {
 	binding = b;
 	model = m;
 	context = ctx;
+	maxInputTokens = batchSize;
+	truncationWarned = false;
 	disposed = false;
 }
 
@@ -310,8 +330,24 @@ function assertReady(): void {
  * Internal: generate a single embedding (must be called within the serial queue).
  */
 async function embedOne(text: string): Promise<number[]> {
-	const tokens: Uint32Array = model!.tokenize(text, false);
+	let tokens: Uint32Array = model!.tokenize(text, false);
 	if (tokens.length === 0) return [];
+
+	// Belt-and-suspenders: reserve 2 slots for BOS/EOS and truncate anything
+	// that would exceed the live context's n_ubatch. Prevents GGML_ASSERT when
+	// callers pass an explicit `batchSize` smaller than their real inputs.
+	const maxBodyTokens = Math.max(1, maxInputTokens - 2);
+	if (tokens.length > maxBodyTokens) {
+		if (!truncationWarned) {
+			console.warn(
+				`[harper-fabric-embeddings] Input tokenized to ${tokens.length} tokens, ` +
+					`truncating to ${maxBodyTokens} (batchSize=${maxInputTokens}). ` +
+					`Increase batchSize/contextSize if you need longer inputs embedded in full.`
+			);
+			truncationWarned = true;
+		}
+		tokens = tokens.subarray(0, maxBodyTokens);
+	}
 
 	const input = buildTokenSequence(tokens);
 	context!.initBatch(input.length);
@@ -353,6 +389,8 @@ export async function dispose(): Promise<void> {
 	}
 	bosToken = -1;
 	eosToken = -1;
+	maxInputTokens = 0;
+	truncationWarned = false;
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────────

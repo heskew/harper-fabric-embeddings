@@ -59,7 +59,7 @@ await dispose();
 | `modelsDir`   | string | —                    | Directory to search/download model files |
 | `modelName`   | string | `"nomic-embed-text"` | Model name from the built-in registry    |
 | `contextSize` | number | `2048`               | Token context window size                |
-| `batchSize`   | number | `512`                | Batch processing size                    |
+| `batchSize`   | number | `contextSize`        | Batch size (sets both `n_batch` and `n_ubatch`). Defaults to `contextSize` so the full context window is usable; inputs longer than `batchSize` are truncated with a one-time warning. |
 | `threads`     | number | `6`                  | CPU threads for inference                |
 | `gpuLayers`   | number | `0`                  | Layers to offload to GPU (0 = CPU only)  |
 | `addonPath`   | string | —                    | Override path to `llama-addon.node`      |
