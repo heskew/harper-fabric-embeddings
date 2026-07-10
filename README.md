@@ -18,6 +18,67 @@ npm install @node-llama-cpp/mac-x64          # macOS Intel
 npm install @node-llama-cpp/linux-arm64      # Linux ARM64
 ```
 
+## Use as a Harper models backend
+
+Harper's models bootstrap can load this package directly as an embedding
+backend. Install it in the Harper instance root and name it in
+`harperdb-config.yaml`:
+
+```yaml
+models:
+  embedding:
+    default:
+      backend: harper-fabric-embeddings
+      modelName: nomic-embed-text
+      modelsDir: ./models
+```
+
+Everything that consumes Harper's models API then routes through the local
+GGUF engine: `models.embed()`, `@embed` table directives, and model-call
+analytics (`hdb_model_calls` gets `embeddingTokens` + `latencyMs` per call).
+
+- `modelsDir` or `modelPath` is required. Relative paths resolve against
+  Harper's working directory.
+- `model` is accepted as an alias for `modelName` (the field Harper's
+  built-in backends use). `contextSize`, `batchSize`, `threads`, `gpuLayers`,
+  and `addonPath` pass through as with `init()`.
+- Boot is not blocked on the model: registration kicks off the load/download
+  in the background and the first embed call awaits it. Misconfiguration
+  (wrong kind, missing model source, unknown model name) fails at boot, where
+  Harper logs and skips the entry.
+- `inputType` is honored: nomic models get their `search_document: ` /
+  `search_query: ` task prefixes, so document and query encodings are
+  distinguished correctly. Harper's `@embed` directive passes
+  `inputType: 'document'`; when `inputType` is omitted (the default through
+  `models.embed()`), **no prefix** is applied — input handling identical to
+  the raw API and to 0.2.x, so pre-existing vectors stay comparable. Corpora
+  embedded prefix-less need a one-time re-embed to benefit from prefixed
+  queries.
+- Vector dimensionality: Harper's `models` facade has no model-metadata
+  accessor yet, so read it from the first embed result
+  (`(await models.embed('x'))[0].length` — 768 for both built-in nomic
+  models), or use `dimensions()` on the raw API.
+- Multiple entries work — each gets its own engine (own model + context),
+  sharing one native addon binding:
+
+```yaml
+models:
+  embedding:
+    default:
+      backend: harper-fabric-embeddings
+      modelName: nomic-embed-text
+      modelsDir: ./models
+      fallback: [remote]
+    moe:
+      backend: harper-fabric-embeddings
+      modelName: nomic-embed-text-v2-moe
+      modelsDir: ./models
+    remote:
+      backend: openai
+      model: text-embedding-3-small
+      apiKey: ${OPENAI_API_KEY}
+```
+
 ## Usage
 
 ```typescript

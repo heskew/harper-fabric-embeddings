@@ -19,7 +19,8 @@ Published as `harper-fabric-embeddings` on npm. Used by `harper-kb` as an option
 ```
 harper-fabric-embeddings
 ├── src/
-│   └── index.ts   ← Single-file TypeScript module, entire public API
+│   ├── index.ts   ← Public API: raw init/embed, handleApplication, register factory
+│   └── engine.ts  ← EmbeddingEngine class, shared addon binding registry, model download
 ├── dist/          ← Compiled output (gitignored)
 ├── test/
 │   └── index.test.js ← Node.js built-in test runner (plain JS, imports dist)
@@ -114,6 +115,33 @@ MODEL_PATH=/path/to/model.gguf ADDON_PATH=/path/to/llama-addon.node npm test
 ```
 
 Unit tests cover error handling and binary discovery. Integration tests (skipped without `MODEL_PATH`) cover embedding generation, L2 normalization, dimensionality, and cosine similarity comparisons.
+
+## Harper Models Backend
+
+The `register` export is a Harper models-backend factory: Harper's
+`bootstrapModels` imports this package for `backend: harper-fabric-embeddings`
+entries under `models.embedding.<name>` in `harperdb-config.yaml` and invokes
+`register({ logicalName, kind, config })`. It registers the engine via the
+global `models.registerBackend` / `models.defineBackend` API (no Harper
+imports needed), wiring it into `models.embed()`, `@embed` directives, and
+model-call analytics.
+
+Key behaviors:
+
+- **Fast boot** — registration starts the model load/download in the
+  background; the first embed call awaits it. A failed attempt retries on the
+  next call. Misconfiguration throws at registration so Harper's bootstrap
+  logs and skips the entry at boot.
+- **Per-registration engines** — each config entry gets its own
+  `EmbeddingEngine` (own model, context, serial queue). The native addon
+  binding is shared across engines via a refcounted registry in `engine.ts`.
+- **nomic task prefixes** — `inputType: 'document' | 'query'` applies
+  `search_document: ` / `search_query: ` for nomic models (mirrors Harper's
+  built-in ollama backend).
+- **Usage reporting** — backend calls return `embeddingTokens` and
+  `latencyMs`, which Harper records in `hdb_model_calls`.
+- **No disposal hook yet** — Harper's registry has no backend dispose
+  lifecycle; engines registered this way live until process exit.
 
 ## How harper-kb Uses This
 
