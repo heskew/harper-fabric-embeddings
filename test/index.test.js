@@ -7,13 +7,22 @@
  * Without MODEL_PATH, only unit tests (error handling, binary discovery) run.
  */
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { init, embed, embedBatch, dimensions, dispose, downloadModel, handleApplication } from '../dist/index.js';
+import { basename, join } from 'node:path';
+import {
+	init,
+	embed,
+	embedBatch,
+	dimensions,
+	dispose,
+	downloadModel,
+	handleApplication,
+	register,
+} from '../dist/index.js';
 
 // ─── Unit tests (no model needed) ──────────────────────────────────────────
 
@@ -128,6 +137,92 @@ describe('handleApplication', () => {
 			// was consulted before the failure.
 		});
 		assert.ok(getAllCalls > 0, 'Expected getAll() to be called at least once when reading config');
+	});
+});
+
+// ─── Harper models-backend factory (unit) ──────────────────────────────────
+
+describe('register (Harper models backend factory)', () => {
+	const originalModels = globalThis.models;
+
+	function fakeModels() {
+		const calls = { registered: [] };
+		globalThis.models = {
+			defineBackend(spec) {
+				calls.spec = spec;
+				return { __defined: spec };
+			},
+			registerBackend(kind, id, backend) {
+				calls.registered.push({ kind, id, backend });
+			},
+		};
+		return calls;
+	}
+
+	afterEach(() => {
+		if (originalModels === undefined) delete globalThis.models;
+		else globalThis.models = originalModels;
+	});
+
+	it('rejects a non-embedding kind', async () => {
+		fakeModels();
+		await assert.rejects(
+			() => register({ logicalName: 'gen', kind: 'generative', config: { modelPath: '/nonexistent.gguf' } }),
+			/embedding backend/
+		);
+	});
+
+	it('rejects when the models global is unavailable', async () => {
+		delete globalThis.models;
+		await assert.rejects(
+			() => register({ logicalName: 'default', kind: 'embedding', config: { modelPath: '/nonexistent.gguf' } }),
+			/models.*not available/
+		);
+	});
+
+	it('rejects at registration when modelPath/modelsDir are missing', async () => {
+		fakeModels();
+		await assert.rejects(
+			() => register({ logicalName: 'default', kind: 'embedding', config: {} }),
+			/Either modelPath or modelsDir is required/
+		);
+	});
+
+	it('rejects at registration on an unknown model name (via the `model` alias)', async () => {
+		fakeModels();
+		await assert.rejects(
+			() =>
+				register({ logicalName: 'default', kind: 'embedding', config: { modelsDir: '/tmp', model: 'not-a-model' } }),
+			/Unknown model: not-a-model/
+		);
+	});
+
+	it('registers under the logical name without awaiting model load (fast boot)', async () => {
+		const calls = fakeModels();
+		await register({ logicalName: 'local', kind: 'embedding', config: { modelPath: '/nonexistent.gguf' } });
+		assert.equal(calls.registered.length, 1);
+		assert.equal(calls.registered[0].kind, 'embedding');
+		assert.equal(calls.registered[0].id, 'local');
+		assert.equal(calls.spec.name, 'fabric-embeddings:nonexistent.gguf');
+		assert.equal(typeof calls.spec.embed, 'function');
+	});
+
+	it('first embed call surfaces the init failure, and later calls retry', async () => {
+		const calls = fakeModels();
+		await register({ logicalName: 'local', kind: 'embedding', config: { modelPath: '/nonexistent.gguf' } });
+		await assert.rejects(() => calls.spec.embed('hello', {}), /Model file not found/);
+		// A failed attempt resets — the next call retries (and fails the same way here).
+		await assert.rejects(() => calls.spec.embed(['a', 'b'], {}), /Model file not found/);
+	});
+
+	it('supports multiple registrations with independent engines', async () => {
+		const calls = fakeModels();
+		await register({ logicalName: 'one', kind: 'embedding', config: { modelPath: '/one.gguf' } });
+		await register({ logicalName: 'two', kind: 'embedding', config: { modelPath: '/two.gguf' } });
+		assert.deepEqual(
+			calls.registered.map((r) => r.id),
+			['one', 'two']
+		);
 	});
 });
 
@@ -246,5 +341,67 @@ describe('embedding truncation with small batchSize', { skip: !MODEL_PATH }, () 
 		const longText = 'The quick brown fox jumps over the lazy dog. '.repeat(70);
 		const vec = await embed(longText);
 		assert.ok(vec.length > 0, 'Expected non-empty vector after truncation');
+	});
+});
+
+// The prefix assertions only hold for nomic models (others get no prefix, so
+// document and query vectors are identical). CI's integration model is nomic.
+const NOMIC_MODEL = MODEL_PATH ? /nomic-embed-text/i.test(basename(MODEL_PATH)) : false;
+
+describe('register backend embed (integration)', { skip: !MODEL_PATH }, () => {
+	const originalModels = globalThis.models;
+	let spec;
+	let engine;
+
+	before(async () => {
+		globalThis.models = {
+			defineBackend(s) {
+				spec = s;
+				return s;
+			},
+			registerBackend() {},
+		};
+		engine = await register({
+			logicalName: 'default',
+			kind: 'embedding',
+			config: { modelPath: MODEL_PATH, addonPath: ADDON_PATH, threads: 4 },
+		});
+	});
+
+	after(async () => {
+		if (originalModels === undefined) delete globalThis.models;
+		else globalThis.models = originalModels;
+		if (engine) await engine.dispose();
+	});
+
+	it('embeds through the models-backend contract', async () => {
+		const result = await spec.embed('Hello world', { inputType: 'document' });
+		assert.equal(result.status, 'completed');
+		assert.equal(result.output.length, 1);
+		assert.ok(result.output[0] instanceof Float32Array, 'Expected Float32Array output');
+		assert.ok(result.output[0].length > 0, 'Expected non-empty vector');
+		const mag = Math.sqrt(result.output[0].reduce((s, v) => s + v * v, 0));
+		assert.ok(Math.abs(mag - 1.0) < 0.01, `Expected unit vector, magnitude = ${mag}`);
+		assert.ok(result.usage.embeddingTokens > 0, 'Expected a token count');
+		assert.ok(result.usage.latencyMs >= 0, 'Expected a latency measurement');
+	});
+
+	it('accepts string[] input and returns one vector per input', async () => {
+		const result = await spec.embed(['first text', 'second text'], {});
+		assert.equal(result.output.length, 2);
+	});
+
+	it('applies nomic task prefixes: document and query vectors differ', { skip: !NOMIC_MODEL }, async () => {
+		const [doc] = (await spec.embed('sailing ships across the ocean', { inputType: 'document' })).output;
+		const [query] = (await spec.embed('sailing ships across the ocean', { inputType: 'query' })).output;
+		let dot = 0;
+		for (let i = 0; i < doc.length; i++) dot += doc[i] * query[i];
+		assert.ok(dot < 0.999, `Expected the task prefix to shift the vector, cosine = ${dot}`);
+	});
+
+	it('rejects a pre-aborted signal without decoding', async () => {
+		const controller = new AbortController();
+		controller.abort();
+		await assert.rejects(() => spec.embed('never embedded', { signal: controller.signal }));
 	});
 });
