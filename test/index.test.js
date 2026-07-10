@@ -9,7 +9,7 @@
 
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -22,6 +22,7 @@ import {
 	downloadModel,
 	handleApplication,
 	register,
+	EmbeddingEngine,
 } from '../dist/index.js';
 
 // ─── Unit tests (no model needed) ──────────────────────────────────────────
@@ -224,6 +225,87 @@ describe('register (Harper models backend factory)', () => {
 			['one', 'two']
 		);
 	});
+
+	it('coerces string numeric config values (YAML env-var expansion)', async () => {
+		const calls = fakeModels();
+		await register({
+			logicalName: 'coerced',
+			kind: 'embedding',
+			config: { modelPath: '/nonexistent.gguf', threads: '4', contextSize: '2048', batchSize: '1024', gpuLayers: '0' },
+		});
+		assert.equal(calls.registered.length, 1);
+	});
+
+	it('rejects a non-numeric config value at registration', async () => {
+		fakeModels();
+		await assert.rejects(
+			() => register({ logicalName: 'bad', kind: 'embedding', config: { modelPath: '/x.gguf', threads: 'lots' } }),
+			/threads must be a finite number/
+		);
+	});
+
+	it('rejects a batchSize too small for BOS + token + EOS', async () => {
+		fakeModels();
+		await assert.rejects(
+			() => register({ logicalName: 'tiny', kind: 'embedding', config: { modelPath: '/x.gguf', batchSize: 2 } }),
+			/batchSize must be at least 3/
+		);
+	});
+});
+
+describe('EmbeddingEngine dispose', () => {
+	it('embedMany after dispose fails fast without touching native resources', async () => {
+		const engine = new EmbeddingEngine({ modelPath: '/nonexistent.gguf' });
+		await engine.dispose();
+		await assert.rejects(() => engine.embedMany(['hello']), /disposed/);
+	});
+});
+
+describe('download lock recovery', () => {
+	const originalFetch = globalThis.fetch;
+
+	function fakeFetch(content) {
+		globalThis.fetch = async () => new Response(content);
+	}
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it('reclaims a stale .downloading lock left by a dead worker', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'hfe-test-'));
+		try {
+			// A live download keeps the lock's mtime fresh; backdate it to simulate
+			// a worker killed mid-download (SIGKILL/OOM leaves no catch cleanup).
+			const lockFile = join(dir, 'nomic-embed-text-v1.5.Q4_K_M.gguf.downloading');
+			writeFileSync(lockFile, 'partial');
+			const past = new Date(Date.now() - 120_000);
+			utimesSync(lockFile, past, past);
+
+			fakeFetch('fake-model-bytes');
+			const result = await downloadModel(dir, 'nomic-embed-text');
+			assert.equal(result, join(dir, 'nomic-embed-text-v1.5.Q4_K_M.gguf'));
+			assert.equal(readFileSync(result, 'utf8'), 'fake-model-bytes');
+		} finally {
+			await rm(dir, { recursive: true });
+		}
+	});
+
+	it('a waiting worker takes over when the downloader fails without producing a file', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'hfe-test-'));
+		try {
+			const lockFile = join(dir, 'nomic-embed-text-v1.5.Q4_K_M.gguf.downloading');
+			writeFileSync(lockFile, '');
+			// Simulate the winning worker dying: lock vanishes, no final file appears
+			setTimeout(() => unlinkSync(lockFile), 300);
+
+			fakeFetch('recovered-model-bytes');
+			const result = await downloadModel(dir, 'nomic-embed-text');
+			assert.equal(readFileSync(result, 'utf8'), 'recovered-model-bytes');
+		} finally {
+			await rm(dir, { recursive: true });
+		}
+	});
 });
 
 // ─── Integration tests (need MODEL_PATH env var) ───────────────────────────
@@ -403,5 +485,19 @@ describe('register backend embed (integration)', { skip: !MODEL_PATH }, () => {
 		const controller = new AbortController();
 		controller.abort();
 		await assert.rejects(() => spec.embed('never embedded', { signal: controller.signal }));
+	});
+});
+
+describe('engine dispose during in-flight embed (integration)', { skip: !MODEL_PATH }, () => {
+	it('dispose() drains the queue instead of freeing the native context under a decode', async () => {
+		const engine = new EmbeddingEngine({ modelPath: MODEL_PATH, addonPath: ADDON_PATH, threads: 4 });
+		// Warm up so the next embed goes straight to a native decode
+		await engine.embedMany(['warmup']);
+		const inflight = engine.embedMany(['some text to embed', 'and some more text']);
+		const disposal = engine.dispose();
+		const result = await inflight;
+		assert.equal(result.vectors.length, 2);
+		await disposal;
+		await assert.rejects(() => engine.embedMany(['after dispose']), /disposed/);
 	});
 });

@@ -9,10 +9,11 @@
  * engines stay independent through the shared native code).
  */
 
-import { createWriteStream, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { open, rename, unlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -135,6 +136,11 @@ interface BindingEntry {
 // One dlopen + backend load per addon path, shared across engines. Refcounted
 // so the last engine's dispose() tears the addon down (matching the pre-engine
 // module behavior); a failed load is evicted so the next acquire retries.
+//
+// Not atomic across the dispose await: an acquire racing the final release can
+// dlopen a handle the in-flight dispose is tearing down. Accepted — it needs
+// two engines on one addon path with one disposing while the other inits, and
+// the models-backend path never disposes engines today.
 const bindings = new Map<string, BindingEntry>();
 
 function acquireBinding(addonPath: string): Promise<LlamaBinding> {
@@ -200,6 +206,10 @@ export class EmbeddingEngine {
 	#maxInputTokens = 0;
 	#truncationWarned = false;
 	#disposed = false;
+	// Set at dispose() entry, before the queue drain. Embeds already queued on an
+	// initialized engine complete; anything needing a fresh init (or submitted
+	// after) rejects instead of starting native work during shutdown.
+	#disposeStarted = false;
 	#initPromise: Promise<void> | null = null;
 	// Serial queue for embed calls — llama.cpp context is not safe for concurrent use
 	#queue: Promise<unknown> = Promise.resolve();
@@ -211,6 +221,13 @@ export class EmbeddingEngine {
 		const modelName = options.modelName ?? 'nomic-embed-text';
 		if (!options.modelPath && !MODELS[modelName]) {
 			throw new Error(`Unknown model: ${modelName}. Available: ${Object.keys(MODELS).join(', ')}`);
+		}
+		// The truncation guard in #embedOne reserves 2 slots for BOS/EOS; an
+		// effective batch below 3 can still build a 3-token sequence and trip the
+		// llama.cpp GGML_ASSERT that kills the host process. Reject up front.
+		const effectiveBatchSize = options.batchSize ?? options.contextSize ?? 2048;
+		if (effectiveBatchSize < 3) {
+			throw new Error(`batchSize must be at least 3 (one body token plus BOS/EOS), got ${effectiveBatchSize}`);
 		}
 		this.#options = options;
 		this.#modelIdentity = options.modelPath ? path.basename(options.modelPath) : modelName;
@@ -236,7 +253,7 @@ export class EmbeddingEngine {
 	}
 
 	async #doInit(): Promise<void> {
-		if (this.#disposed) throw new Error('Engine has been disposed.');
+		if (this.#disposed || this.#disposeStarted) throw new Error('Engine has been disposed.');
 
 		const {
 			modelPath: explicitPath,
@@ -275,6 +292,9 @@ export class EmbeddingEngine {
 				checkTensors: false,
 			});
 			if (!(await model.init())) {
+				// Dispose before nulling: a false init() may still hold native
+				// resources, and the catch below skips dispose for a null model.
+				await model.dispose().catch(() => {});
 				model = null;
 				throw new Error('Failed to load model');
 			}
@@ -315,6 +335,8 @@ export class EmbeddingEngine {
 	 * flight can't be interrupted).
 	 */
 	embedMany(texts: string[], opts: EmbedManyOptions = {}): Promise<EmbedManyResult> {
+		// Fail an already-aborted call synchronously instead of parking it in the queue.
+		opts.signal?.throwIfAborted();
 		const result = this.#queue.then(async () => {
 			await this.ensureReady();
 			this.#assertReady();
@@ -338,8 +360,18 @@ export class EmbeddingEngine {
 		return this.#model.getEmbeddingVectorSize();
 	}
 
-	/** Clean up native resources. */
+	/**
+	 * Clean up native resources.
+	 *
+	 * Drains the embed queue before touching native handles — disposing the
+	 * llama.cpp context while a decodeBatch is executing is a use-after-free
+	 * that can kill the host process. Embeds accepted before this call complete
+	 * (when the engine is initialized); embeds that would need a fresh init
+	 * during disposal, and any submitted after, reject with a disposed error.
+	 */
 	async dispose(): Promise<void> {
+		this.#disposeStarted = true;
+		await this.#queue.catch(() => {});
 		this.#disposed = true;
 		this.#initPromise = null;
 		if (this.#context) {
@@ -485,7 +517,23 @@ async function resolveModelPath(dir: string, modelName: string): Promise<string>
 }
 
 /**
+ * A `.downloading` lock untouched for this long is considered abandoned and is
+ * reclaimed. An active download keeps the lock file's mtime fresh — the bytes
+ * stream into it — so only a dead owner (SIGKILL / OOM / power loss mid-download)
+ * leaves it unmoving.
+ */
+const LOCK_STALE_MS = 60_000;
+
+/** Total time a worker will wait on other workers before giving up. */
+const DOWNLOAD_WAIT_TIMEOUT_MS = 300_000;
+
+/**
  * Download a model from Hugging Face.
+ *
+ * Cross-worker coordination: exclusive creation of `<file>.downloading` elects
+ * one downloader; the rest poll. A lock whose owner died is reclaimed after
+ * `LOCK_STALE_MS`, and a waiter whose winner failed (lock vanished, no final
+ * file) retakes the lock and retries rather than timing out.
  */
 export async function downloadModel(dir: string, modelName = 'nomic-embed-text'): Promise<string> {
 	const config = MODELS[modelName];
@@ -501,51 +549,79 @@ export async function downloadModel(dir: string, modelName = 'nomic-embed-text')
 	if (existsSync(destPath)) return destPath;
 
 	const tmpPath = destPath + '.downloading';
+	const deadline = Date.now() + DOWNLOAD_WAIT_TIMEOUT_MS;
 
-	// Try to exclusively create the temp file — only one worker wins
-	let lockHandle;
-	try {
-		lockHandle = await open(tmpPath, 'wx');
-	} catch {
-		// Another worker is downloading — wait for the final file
-		console.log(`[harper-fabric-embeddings] Waiting for another worker to finish downloading ${config.file}...`);
-		await waitForFile(destPath);
-		return destPath;
-	}
+	while (true) {
+		reclaimStaleLock(tmpPath);
 
-	// We won the lock — download the model
-	try {
-		console.log(`[harper-fabric-embeddings] Downloading ${config.file} from Hugging Face...`);
-		await lockHandle.close();
-
-		const url = `https://huggingface.co/${config.repo}/resolve/main/${config.file}`;
-		const response = await fetch(url, { redirect: 'follow' });
-		if (!response.ok) {
-			throw new Error(`Download failed: ${response.status} ${response.statusText} — ${url}`);
+		// Try to exclusively create the temp file — only one worker wins
+		let lockHandle;
+		try {
+			lockHandle = await open(tmpPath, 'wx');
+		} catch {
+			// Another worker is downloading — wait for it to finish or fail
+			console.log(`[harper-fabric-embeddings] Waiting for another worker to finish downloading ${config.file}...`);
+			const outcome = await waitForDownload(destPath, tmpPath, deadline);
+			if (outcome === 'complete') return destPath;
+			continue; // lock vanished or went stale without a final file — take over
 		}
 
-		const fileStream = createWriteStream(tmpPath);
-		await pipeline(response.body!, fileStream);
+		// We won the lock — download the model
+		try {
+			console.log(`[harper-fabric-embeddings] Downloading ${config.file} from Hugging Face...`);
+			await lockHandle.close();
 
-		// Rename to final path (atomic on same filesystem)
-		await rename(tmpPath, destPath);
-		console.log(`[harper-fabric-embeddings] Downloaded ${config.file} to ${destPath}`);
-	} catch (err) {
-		await unlink(tmpPath).catch(() => {});
-		throw err;
+			const url = `https://huggingface.co/${config.repo}/resolve/main/${config.file}`;
+			const response = await fetch(url, { redirect: 'follow' });
+			if (!response.ok) {
+				throw new Error(`Download failed: ${response.status} ${response.statusText} — ${url}`);
+			}
+
+			const fileStream = createWriteStream(tmpPath);
+			await pipeline(response.body!, fileStream);
+
+			// Rename to final path (atomic on same filesystem)
+			await rename(tmpPath, destPath);
+			console.log(`[harper-fabric-embeddings] Downloaded ${config.file} to ${destPath}`);
+		} catch (err) {
+			await unlink(tmpPath).catch(() => {});
+			throw err;
+		}
+
+		return destPath;
 	}
+}
 
-	return destPath;
+/** Remove a `.downloading` lock whose owner died (no mtime movement for `LOCK_STALE_MS`). */
+function reclaimStaleLock(tmpPath: string): void {
+	try {
+		if (Date.now() - statSync(tmpPath).mtimeMs > LOCK_STALE_MS) {
+			console.warn(`[harper-fabric-embeddings] Reclaiming stale download lock ${tmpPath}`);
+			unlinkSync(tmpPath);
+		}
+	} catch {
+		// No lock file (or it vanished between stat and unlink) — nothing to reclaim.
+	}
 }
 
 /**
- * Poll until a file appears on disk (another worker is downloading it).
+ * Poll until the download completes (`'complete'`), the lock disappears or goes
+ * stale without a final file (`'retry'` — the caller retakes the lock), or the
+ * deadline passes (throws).
  */
-async function waitForFile(filePath: string, timeoutMs = 300_000): Promise<void> {
-	const start = Date.now();
-	while (!existsSync(filePath)) {
-		if (Date.now() - start > timeoutMs) {
-			throw new Error(`Timed out waiting for model download: ${filePath}`);
+async function waitForDownload(destPath: string, tmpPath: string, deadline: number): Promise<'complete' | 'retry'> {
+	while (true) {
+		if (existsSync(destPath)) return 'complete';
+		let lockAlive: boolean;
+		try {
+			lockAlive = Date.now() - statSync(tmpPath).mtimeMs <= LOCK_STALE_MS;
+		} catch {
+			// Lock gone: the winner either renamed to destPath (check again) or failed.
+			return existsSync(destPath) ? 'complete' : 'retry';
+		}
+		if (!lockAlive) return 'retry';
+		if (Date.now() > deadline) {
+			throw new Error(`Timed out waiting for model download: ${destPath}`);
 		}
 		await sleep(500);
 	}
@@ -565,7 +641,9 @@ function findAddonBinary(): string {
 		'@node-llama-cpp/linux-arm64',
 	];
 
-	const moduleDir = path.dirname(new URL(import.meta.url).pathname);
+	// fileURLToPath, not URL.pathname: pathname is percent-encoded (spaces → %20)
+	// and carries a broken leading slash on Windows, so existsSync would miss.
+	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 	const searchRoots = [
 		path.join(process.cwd(), 'node_modules'),
 		// Sibling packages in the same node_modules as harper-fabric-embeddings

@@ -48,7 +48,16 @@ analytics (`hdb_model_calls` gets `embeddingTokens` + `latencyMs` per call).
   Harper logs and skips the entry.
 - `inputType` is honored: nomic models get their `search_document: ` /
   `search_query: ` task prefixes, so document and query encodings are
-  distinguished correctly.
+  distinguished correctly. Harper's `@embed` directive passes
+  `inputType: 'document'`; when `inputType` is omitted (the default through
+  `models.embed()`), **no prefix** is applied — input handling identical to
+  the raw API and to 0.2.x, so pre-existing vectors stay comparable. Corpora
+  embedded prefix-less need a one-time re-embed to benefit from prefixed
+  queries.
+- Vector dimensionality: Harper's `models` facade has no model-metadata
+  accessor yet, so read it from the first embed result
+  (`(await models.embed('x'))[0].length` — 768 for both built-in nomic
+  models), or use `dimensions()` on the raw API.
 - Multiple entries work — each gets its own engine (own model + context),
   sharing one native addon binding:
 

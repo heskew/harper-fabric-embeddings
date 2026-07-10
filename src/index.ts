@@ -112,6 +112,11 @@ export async function dispose(): Promise<void> {
  * Reads config from scope.options, initializes the GGUF engine, and
  * handles close/change events for cleanup and hot-reload.
  *
+ * Uses the module-level default engine: two sub-components loading this
+ * package in the same worker share one engine (the second's config is
+ * ignored, and either's close tears it down for both). When you need
+ * per-entry engines, use the models-backend `register` path instead.
+ *
  * Config options (in parent config.yaml):
  *   modelName   — model from the built-in registry (default: nomic-embed-text)
  *   modelsDir   — override models directory (default: <plugin dir>/models)
@@ -141,10 +146,10 @@ export async function handleApplication(scope: {
 		return {
 			modelsDir: (opts.modelsDir as string) || path.join(scope.directory, 'models'),
 			modelName: (opts.modelName as string) || 'nomic-embed-text',
-			contextSize: opts.contextSize as number | undefined,
-			batchSize: opts.batchSize as number | undefined,
-			threads: opts.threads as number | undefined,
-			gpuLayers: opts.gpuLayers as number | undefined,
+			contextSize: toFiniteNumber(opts.contextSize, 'contextSize'),
+			batchSize: toFiniteNumber(opts.batchSize, 'batchSize'),
+			threads: toFiniteNumber(opts.threads, 'threads'),
+			gpuLayers: toFiniteNumber(opts.gpuLayers, 'gpuLayers'),
 			addonPath: opts.addonPath as string | undefined,
 		};
 	}
@@ -284,10 +289,25 @@ function engineOptionsFromConfig(config: Record<string, unknown>): EngineOptions
 		// `model` is the conventional per-entry field on Harper's built-in
 		// backends; `modelName` is this package's native option. Either works.
 		modelName: (c.modelName as string | undefined) ?? (c.model as string | undefined),
-		contextSize: c.contextSize as number | undefined,
-		batchSize: c.batchSize as number | undefined,
-		threads: c.threads as number | undefined,
-		gpuLayers: c.gpuLayers as number | undefined,
+		contextSize: toFiniteNumber(c.contextSize, 'contextSize'),
+		batchSize: toFiniteNumber(c.batchSize, 'batchSize'),
+		threads: toFiniteNumber(c.threads, 'threads'),
+		gpuLayers: toFiniteNumber(c.gpuLayers, 'gpuLayers'),
 		addonPath: c.addonPath as string | undefined,
 	};
+}
+
+/**
+ * Coerce a numeric config value. YAML env-var expansion (`threads: ${THREADS}`)
+ * and quoted values (`"2048"`) deliver strings; these fields feed native
+ * constructors and the truncation math, so a non-finite value must fail at
+ * registration, not inside the addon.
+ */
+function toFiniteNumber(value: unknown, field: string): number | undefined {
+	if (value === undefined || value === null || value === '') return undefined;
+	const n = Number(value);
+	if (!Number.isFinite(n)) {
+		throw new Error(`${field} must be a finite number, got '${String(value)}'`);
+	}
+	return n;
 }
