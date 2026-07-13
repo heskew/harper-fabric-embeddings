@@ -46,14 +46,14 @@ analytics (`hdb_model_calls` gets `embeddingTokens` + `latencyMs` per call).
   in the background and the first embed call awaits it. Misconfiguration
   (wrong kind, missing model source, unknown model name) fails at boot, where
   Harper logs and skips the entry.
-- `inputType` is honored: nomic models get their `search_document: ` /
-  `search_query: ` task prefixes, so document and query encodings are
-  distinguished correctly. Harper's `@embed` directive passes
+- `inputType` is honored: each model's **prompt templates** (see below) shape
+  document vs query encodings — nomic models get their `search_document: ` /
+  `search_query: ` task prefixes. Harper's `@embed` directive passes
   `inputType: 'document'`; when `inputType` is omitted (the default through
-  `models.embed()`), **no prefix** is applied — input handling identical to
-  the raw API and to 0.2.x, so pre-existing vectors stay comparable. Corpora
-  embedded prefix-less need a one-time re-embed to benefit from prefixed
-  queries.
+  `models.embed()`), **no template is applied, ever** — input handling
+  identical to the raw API and to 0.2.x, so pre-existing vectors stay
+  comparable. Corpora embedded template-less need a one-time re-embed to
+  benefit from templated queries.
 - Vector dimensionality: Harper's `models` facade has no model-metadata
   accessor yet, so read it from the first embed result
   (`(await models.embed('x'))[0].length` — 768 for both built-in nomic
@@ -131,6 +131,41 @@ Clean up native resources (model, context, binding).
 ### `downloadModel(dir, modelName?)`
 
 Download a model from HuggingFace. Called automatically by `init()` when using `modelsDir` and no local model is found.
+
+## Prompt templates
+
+Embedding models disagree about how document and query inputs should be
+affixed — nomic wants fixed prefixes, instruct-style embedders (Qwen3-Embedding
+and friends) want a free-text task instruction on the query side only. That
+convention is **data on the model entry**, not code:
+
+```yaml
+models:
+  embedding:
+    default:
+      backend: harper-fabric-embeddings
+      modelPath: ./models/my-model.Q8_0.gguf
+      templates:
+        document: '{text}'
+        query: "Instruct: {task}\nQuery: {text}"
+        defaults:
+          task: 'Given a search query, retrieve relevant passages that answer the query'
+```
+
+- `{text}` is the input text. `{task}` comes from the embed call's `task`
+  option (`models.embed(q, { inputType: 'query', task: '...' })`), falling
+  back to `defaults.task`. Any other placeholder must be covered by
+  `defaults`. Escape literal braces as `{{` / `}}`.
+- Interpolation is single-pass; invalid templates (unknown placeholders,
+  unescaped braces) fail at registration — Harper logs and skips the entry at
+  boot rather than surfacing at first embed.
+- Omitted `inputType` is always passthrough, templates or not. A missing side
+  (e.g. only `query` declared) falls back to the legacy nomic name-prefix
+  heuristic, then passthrough.
+- The built-in nomic entries declare their prefixes as templates; explicit
+  `templates` in config override an entry's own.
+- Note for typed Harper consumers: `task` passes through `models.embed()` at
+  runtime, but isn't on core's `EmbedOpts` type yet — cast until core widens it.
 
 ## Models
 
