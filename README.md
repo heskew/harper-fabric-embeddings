@@ -143,6 +143,11 @@ Two models are built in:
 
 Models are resolved in order: HuggingFace-prefixed filename, bare filename, stem match scan, then download from HuggingFace.
 
+HuggingFace may reject anonymous large-file downloads (HTTP 403). Set
+`HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) to a free account token and the
+download sends it as a bearer; alternatively pre-seed `modelsDir` with the
+model file and no download happens at all.
+
 ## Testing
 
 ```sh

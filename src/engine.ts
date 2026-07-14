@@ -572,9 +572,21 @@ export async function downloadModel(dir: string, modelName = 'nomic-embed-text')
 			await lockHandle.close();
 
 			const url = `https://huggingface.co/${config.repo}/resolve/main/${config.file}`;
-			const response = await fetch(url, { redirect: 'follow' });
+			// HuggingFace 403s anonymous large-file (CDN) downloads in some
+			// environments; a free account token clears it. undici strips the
+			// Authorization header on the cross-origin redirect to the CDN, so the
+			// token never reaches the signed-URL host.
+			const token = process.env.HF_TOKEN || process.env.HUGGING_FACE_HUB_TOKEN;
+			const response = await fetch(url, {
+				redirect: 'follow',
+				headers: token ? { authorization: `Bearer ${token}` } : undefined,
+			});
 			if (!response.ok) {
-				throw new Error(`Download failed: ${response.status} ${response.statusText} — ${url}`);
+				const hint =
+					response.status === 403 && !token
+						? ' (HuggingFace may require authentication for large-file downloads — set HF_TOKEN)'
+						: '';
+				throw new Error(`Download failed: ${response.status} ${response.statusText} — ${url}${hint}`);
 			}
 
 			const fileStream = createWriteStream(tmpPath);
