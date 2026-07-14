@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
 	init,
 	embed,
@@ -24,6 +24,7 @@ import {
 	register,
 	EmbeddingEngine,
 	renderTemplate,
+	resolveEngineTemplates,
 	validateTemplates,
 } from '../dist/index.js';
 
@@ -286,6 +287,45 @@ describe('renderTemplate', () => {
 	it('never resolves prototype properties as placeholder values', () => {
 		assert.throws(() => renderTemplate('{toString} {text}', { text: 'x' }), /No value for template placeholder/);
 	});
+
+	it('renders the built-in nomic templates byte-identically to the legacy prefixes', () => {
+		// Downstream HNSW corpora are stamped against the exact old strings —
+		// one character of drift (trailing space, added newline) silently
+		// invalidates every stored vector.
+		assert.equal(renderTemplate('search_document: {text}', { text: 'hello world' }), 'search_document: hello world');
+		assert.equal(renderTemplate('search_query: {text}', { text: 'hello world' }), 'search_query: hello world');
+		assert.equal(renderTemplate('search_document: {text}', { text: '' }), 'search_document: ');
+	});
+
+	it('inserts replacement-pattern tokens in values literally (function replacer)', () => {
+		assert.equal(renderTemplate('search_document: {text}', { text: "$& $1 $' $$" }), "search_document: $& $1 $' $$");
+	});
+});
+
+describe('resolveEngineTemplates', () => {
+	it('modelName-only construction (the models-backend production path) resolves registry templates', () => {
+		const templates = resolveEngineTemplates({ modelsDir: '/x', modelName: 'nomic-embed-text' });
+		assert.equal(templates.document, 'search_document: {text}');
+		assert.equal(templates.query, 'search_query: {text}');
+	});
+
+	it('defaults to the nomic-embed-text entry when modelName is omitted', () => {
+		const templates = resolveEngineTemplates({ modelsDir: '/x' });
+		assert.equal(templates.document, 'search_document: {text}');
+	});
+
+	it('explicit modelPath without templates resolves none (legacy-fallback territory)', () => {
+		assert.equal(resolveEngineTemplates({ modelPath: '/m.gguf' }), undefined);
+	});
+
+	it('explicit templates win over the registry entry', () => {
+		const templates = resolveEngineTemplates({
+			modelsDir: '/x',
+			modelName: 'nomic-embed-text',
+			templates: { document: 'D {text}' },
+		});
+		assert.equal(templates.document, 'D {text}');
+	});
 });
 
 describe('validateTemplates', () => {
@@ -322,6 +362,13 @@ describe('validateTemplates', () => {
 
 	it('rejects prototype-property placeholder names (no `in`-chain leak)', () => {
 		assert.throws(() => validateTemplates({ query: '{toString} {text}' }), /\{toString\}/);
+	});
+
+	it('rejects unrecognized top-level keys (a typo like documnet would silently unprefix embeds)', () => {
+		assert.throws(
+			() => validateTemplates({ documnet: 'search_document: {text}', query: 'search_query: {text}' }),
+			/unrecognized key 'documnet'/
+		);
 	});
 });
 
@@ -707,6 +754,34 @@ describe('prompt templates (integration)', { skip: !MODEL_PATH }, () => {
 			assert.ok(cosine(withTemplates, without) > 0.99999, 'expected identical embeddings for omitted inputType');
 		} finally {
 			await plainEngine.dispose();
+		}
+	});
+
+	it('modelName construction (production path) applies registry templates equal to manual prefixing', async () => {
+		// The models-backend config constructs via modelName in production —
+		// this is the registry-template branch every other test bypasses via
+		// modelPath. Registry-templated document embed must match embedding the
+		// hand-prefixed legacy string through passthrough.
+		const registryEngine = new EmbeddingEngine({
+			modelsDir: dirname(MODEL_PATH),
+			modelName: 'nomic-embed-text',
+			addonPath: ADDON_PATH,
+			threads: 4,
+		});
+		try {
+			const text = 'registry template production path';
+			const {
+				vectors: [viaRegistry],
+			} = await registryEngine.embedMany([text], { inputType: 'document' });
+			const {
+				vectors: [viaManual],
+			} = await registryEngine.embedMany([`search_document: ${text}`]);
+			assert.ok(
+				cosine(viaRegistry, viaManual) > 0.9999,
+				'registry-template output should match the hand-prefixed legacy string'
+			);
+		} finally {
+			await registryEngine.dispose();
 		}
 	});
 

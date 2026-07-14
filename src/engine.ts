@@ -277,10 +277,7 @@ export class EmbeddingEngine {
 		}
 		this.#options = options;
 		this.#modelIdentity = options.modelPath ? path.basename(options.modelPath) : modelName;
-		// Explicit templates win; a registry model falls back to its entry's
-		// templates; an explicit modelPath with no templates gets none (the
-		// legacy name-prefix heuristic still applies at embed time).
-		const templates = options.templates ?? (options.modelPath ? undefined : MODELS[modelName].templates);
+		const templates = resolveEngineTemplates(options);
 		if (templates) validateTemplates(templates);
 		this.#templates = templates;
 		this.#nomicFallback = /nomic-embed-text/i.test(this.#modelIdentity);
@@ -543,17 +540,38 @@ export class EmbeddingEngine {
 const TEMPLATE_TOKEN = /\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
 /**
+ * Resolve the templates an engine will use: explicit `options.templates` wins;
+ * a registry model falls back to its entry's templates; an explicit `modelPath`
+ * with no explicit templates gets none (the legacy name-prefix heuristic still
+ * applies at embed time). Exported for tests — the models-backend production
+ * path constructs via `modelName` and must resolve the registry branch.
+ */
+export function resolveEngineTemplates(options: EngineOptions): EmbedTemplates | undefined {
+	if (options.templates) return options.templates;
+	if (options.modelPath) return undefined;
+	return MODELS[options.modelName ?? 'nomic-embed-text']?.templates;
+}
+
+/**
  * Validate templates at construction (registration) time, so misconfiguration
- * fails at Harper boot instead of on the first embed call. Every placeholder
- * must be `{text}`, `{task}` (call-suppliable), or covered by `defaults`; any
- * other `{`/`}` must be escaped as `{{` / `}}`.
+ * fails at Harper boot instead of on the first embed call. Unrecognized
+ * top-level keys are rejected (a typo'd side like `documnet:` would otherwise
+ * silently fall back to unprefixed embeds); every placeholder must be `{text}`,
+ * `{task}` (call-suppliable), or covered by `defaults`; any other `{`/`}` must
+ * be escaped as `{{` / `}}`.
  */
 export function validateTemplates(templates: EmbedTemplates): void {
 	if (typeof templates !== 'object' || templates === null || Array.isArray(templates)) {
 		throw new Error('templates must be an object with optional document/query strings and a defaults record');
 	}
+	for (const key of Object.keys(templates)) {
+		if (key !== 'document' && key !== 'query' && key !== 'defaults') {
+			throw new Error(`templates contains unrecognized key '${key}' (expected 'document', 'query', 'defaults')`);
+		}
+	}
+	// `??` already normalized a null/omitted defaults to `{}`.
 	const defaults = templates.defaults ?? {};
-	if (typeof defaults !== 'object' || defaults === null || Array.isArray(defaults)) {
+	if (typeof defaults !== 'object' || Array.isArray(defaults)) {
 		throw new Error('templates.defaults must be a record of string values');
 	}
 	for (const [key, value] of Object.entries(defaults)) {
