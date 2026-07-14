@@ -21,6 +21,31 @@ import path from 'node:path';
 interface ModelConfig {
 	repo: string;
 	file: string;
+	templates?: EmbedTemplates;
+}
+
+/**
+ * Per-inputType prompt templates, declared as data on a model entry (built-in
+ * registry or `templates` in engine/config options) instead of detected by
+ * model-name heuristics in code. See issue #4.
+ *
+ * Placeholders are `{name}` tokens: `{text}` is the input text (always
+ * provided); `{task}` comes from the embed call's `task` option, falling back
+ * to `defaults.task`; any other placeholder must have a value in `defaults`.
+ * Literal braces are escaped as `{{` / `}}`. Interpolation is single-pass —
+ * placeholder values are never re-scanned for placeholders.
+ *
+ * A missing template for an inputType means passthrough, and an omitted
+ * `inputType` is ALWAYS passthrough regardless of templates — that is the
+ * compatibility contract that keeps vectors from older versions comparable.
+ */
+export interface EmbedTemplates {
+	/** Template applied when `inputType: 'document'`. */
+	document?: string;
+	/** Template applied when `inputType: 'query'`. */
+	query?: string;
+	/** Fallback values for non-`{text}` placeholders (e.g. `task`, `title`). */
+	defaults?: Record<string, string>;
 }
 
 export interface EngineOptions {
@@ -47,15 +72,27 @@ export interface EngineOptions {
 	gpuLayers?: number;
 	/** Override path to llama-addon.node. */
 	addonPath?: string;
+	/**
+	 * Prompt templates for this model. Overrides the built-in registry entry's
+	 * templates; validated at construction (registration time). Without this —
+	 * and without registry templates — template-less models fall back to the
+	 * legacy nomic name-prefix heuristic.
+	 */
+	templates?: EmbedTemplates;
 }
 
 export interface EmbedManyOptions {
 	/**
 	 * For models that distinguish document-vs-query embeddings. Applies the
-	 * model's task prefix (`search_document: ` / `search_query: ` for
-	 * nomic-embed-text); ignored for models without a known prefix convention.
+	 * model's template for that side (or the legacy nomic prefix for
+	 * template-less models). Omitted = passthrough, always.
 	 */
 	inputType?: 'document' | 'query';
+	/**
+	 * Free-text task instruction for models whose templates use `{task}`
+	 * (instruct-style embedders). Overrides the entry's `templates.defaults.task`.
+	 */
+	task?: string;
 	/** Best-effort cancellation — checked between inputs, not mid-decode. */
 	signal?: AbortSignal;
 }
@@ -115,14 +152,21 @@ interface LlamaContext {
 
 // ─── Model registry ─────────────────────────────────────────────────────────
 
+const NOMIC_TEMPLATES: EmbedTemplates = {
+	document: 'search_document: {text}',
+	query: 'search_query: {text}',
+};
+
 const MODELS: Record<string, ModelConfig> = {
 	'nomic-embed-text': {
 		repo: 'nomic-ai/nomic-embed-text-v1.5-GGUF',
 		file: 'nomic-embed-text-v1.5.Q4_K_M.gguf',
+		templates: NOMIC_TEMPLATES,
 	},
 	'nomic-embed-text-v2-moe': {
 		repo: 'nomic-ai/nomic-embed-text-v2-moe-GGUF',
 		file: 'nomic-embed-text-v2-moe.Q4_K_M.gguf',
+		templates: NOMIC_TEMPLATES,
 	},
 };
 
@@ -194,6 +238,8 @@ async function loadBinding(addonPath: string): Promise<LlamaBinding> {
 export class EmbeddingEngine {
 	#options: EngineOptions;
 	#modelIdentity: string;
+	#templates: EmbedTemplates | undefined;
+	#nomicFallback: boolean;
 	#binding: LlamaBinding | null = null;
 	#addonPathUsed: string | null = null;
 	#model: LlamaModel | null = null;
@@ -231,6 +277,10 @@ export class EmbeddingEngine {
 		}
 		this.#options = options;
 		this.#modelIdentity = options.modelPath ? path.basename(options.modelPath) : modelName;
+		const templates = resolveEngineTemplates(options);
+		if (templates) validateTemplates(templates);
+		this.#templates = templates;
+		this.#nomicFallback = /nomic-embed-text/i.test(this.#modelIdentity);
 	}
 
 	/** Model name (or model file basename) — used for backend naming and prefix detection. */
@@ -344,7 +394,7 @@ export class EmbeddingEngine {
 			let tokens = 0;
 			for (const text of texts) {
 				opts.signal?.throwIfAborted();
-				const one = await this.#embedOne(this.#applyPrefix(text, opts.inputType));
+				const one = await this.#embedOne(this.#applyTemplate(text, opts));
 				vectors.push(one.vector);
 				tokens += one.tokens;
 			}
@@ -401,13 +451,26 @@ export class EmbeddingEngine {
 		}
 	}
 
-	#applyPrefix(text: string, inputType?: 'document' | 'query'): string {
-		if (!inputType) return text;
-		// nomic-embed-text v1.5+ uses application-layer task prefixes to distinguish
-		// document-corpus encodings from query encodings. Mirrors the convention in
-		// Harper's built-in ollama backend; other model families (BGE, e5, ...) use
-		// their own conventions — add cases as we validate them.
-		if (/nomic-embed-text/i.test(this.#modelIdentity)) {
+	#applyTemplate(text: string, opts: EmbedManyOptions): string {
+		const inputType = opts.inputType;
+		// Contract: omitted inputType is ALWAYS passthrough, templates or not —
+		// input handling stays byte-identical to pre-template versions so
+		// existing vectors remain comparable. The explicit two-value check also
+		// keeps unrecognized runtime values (`inputType: 'toString'` through the
+		// untyped facade path) on the passthrough side instead of resolving
+		// prototype properties off the templates object.
+		if (inputType !== 'document' && inputType !== 'query') return text;
+		const template = this.#templates?.[inputType];
+		if (template) {
+			const vars: Record<string, string> = { ...this.#templates!.defaults };
+			if (opts.task !== undefined) vars.task = opts.task;
+			vars.text = text;
+			return renderTemplate(template, vars);
+		}
+		// Legacy fallback for template-less models (explicit modelPath overrides):
+		// nomic-embed-text v1.5+ task prefixes, detected by name. Mirrors the
+		// convention in Harper's built-in ollama backend.
+		if (this.#nomicFallback) {
 			return (inputType === 'document' ? 'search_document: ' : 'search_query: ') + text;
 		}
 		return text;
@@ -468,6 +531,112 @@ export class EmbeddingEngine {
 
 		return new Uint32Array(parts);
 	}
+}
+
+// ─── Prompt templates ───────────────────────────────────────────────────────
+
+// One pass: `{{` / `}}` escapes and `{name}` placeholders, matched together so
+// values are substituted exactly once and never re-scanned.
+const TEMPLATE_TOKEN = /\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/**
+ * Resolve the templates an engine will use: explicit `options.templates` wins;
+ * a registry model falls back to its entry's templates; an explicit `modelPath`
+ * with no explicit templates gets none (the legacy name-prefix heuristic still
+ * applies at embed time). Exported for tests — the models-backend production
+ * path constructs via `modelName` and must resolve the registry branch.
+ */
+export function resolveEngineTemplates(options: EngineOptions): EmbedTemplates | undefined {
+	if (options.templates) return options.templates;
+	if (options.modelPath) return undefined;
+	return MODELS[options.modelName ?? 'nomic-embed-text']?.templates;
+}
+
+/**
+ * Validate templates at construction (registration) time, so misconfiguration
+ * fails at Harper boot instead of on the first embed call. Unrecognized
+ * top-level keys are rejected (a typo'd side like `documnet:` would otherwise
+ * silently fall back to unprefixed embeds); every placeholder must be `{text}`,
+ * `{task}` (call-suppliable), or covered by `defaults`; any other `{`/`}` must
+ * be escaped as `{{` / `}}`.
+ */
+export function validateTemplates(templates: EmbedTemplates): void {
+	if (typeof templates !== 'object' || templates === null || Array.isArray(templates)) {
+		throw new Error('templates must be an object with optional document/query strings and a defaults record');
+	}
+	for (const key of Object.keys(templates)) {
+		if (key !== 'document' && key !== 'query' && key !== 'defaults') {
+			throw new Error(`templates contains unrecognized key '${key}' (expected 'document', 'query', 'defaults')`);
+		}
+	}
+	// `??` already normalized a null/omitted defaults to `{}`.
+	const defaults = templates.defaults ?? {};
+	if (typeof defaults !== 'object' || Array.isArray(defaults)) {
+		throw new Error('templates.defaults must be a record of string values');
+	}
+	for (const [key, value] of Object.entries(defaults)) {
+		if (typeof value !== 'string') {
+			throw new Error(`templates.defaults.${key} must be a string, got ${typeof value}`);
+		}
+		if (key === 'text') {
+			throw new Error("templates.defaults may not define 'text' — it is always the embed input");
+		}
+	}
+	for (const side of ['document', 'query'] as const) {
+		const template = templates[side];
+		if (template === undefined) continue;
+		if (typeof template !== 'string') {
+			throw new Error(`templates.${side} must be a string, got ${typeof template}`);
+		}
+		// Brace hygiene first, so a placeholder typo like `{ text }` reports as an
+		// unescaped-brace error rather than a missing-{text} error.
+		const residue = template.replace(TEMPLATE_TOKEN, '');
+		if (/[{}]/.test(residue)) {
+			throw new Error(
+				`templates.${side} contains an unescaped '{' or '}' (placeholders are {name}; escape literals as {{ and }})`
+			);
+		}
+		const placeholders = templatePlaceholders(template);
+		if (!placeholders.includes('text')) {
+			// Without {text} every input renders the same static prompt — identical
+			// vectors and silently broken retrieval. Catch the typo at registration.
+			throw new Error(`templates.${side} must include the {text} placeholder`);
+		}
+		for (const name of placeholders) {
+			// Object.hasOwn, not `in`: a prototype-property name ({toString},
+			// {constructor}) must not satisfy the defaults check.
+			if (name !== 'text' && name !== 'task' && !Object.hasOwn(defaults, name)) {
+				throw new Error(
+					`templates.${side} uses {${name}} which is neither {text}, {task}, nor covered by templates.defaults`
+				);
+			}
+		}
+	}
+}
+
+function templatePlaceholders(template: string): string[] {
+	const names: string[] = [];
+	for (const match of template.matchAll(TEMPLATE_TOKEN)) {
+		if (match[1]) names.push(match[1]);
+	}
+	return names;
+}
+
+/** Single-pass interpolation. `vars` must cover every placeholder (validated at registration for all but a default-less `{task}`). */
+export function renderTemplate(template: string, vars: Record<string, string>): string {
+	return template.replace(TEMPLATE_TOKEN, (match, name: string | undefined) => {
+		if (match === '{{') return '{';
+		if (match === '}}') return '}';
+		// Own properties only — a prototype-property placeholder must error, not
+		// coerce an inherited function into the prompt.
+		const value = Object.hasOwn(vars, name!) ? vars[name!] : undefined;
+		if (value === undefined) {
+			throw new Error(
+				`No value for template placeholder {${name}} — pass it in the embed call (e.g. 'task') or add it to templates.defaults`
+			);
+		}
+		return value;
+	});
 }
 
 /** L2-normalize in place. A zero vector is left unchanged. */

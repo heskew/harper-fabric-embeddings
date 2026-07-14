@@ -135,9 +135,13 @@ Key behaviors:
 - **Per-registration engines** — each config entry gets its own
   `EmbeddingEngine` (own model, context, serial queue). The native addon
   binding is shared across engines via a refcounted registry in `engine.ts`.
-- **nomic task prefixes** — `inputType: 'document' | 'query'` applies
-  `search_document: ` / `search_query: ` for nomic models (mirrors Harper's
-  built-in ollama backend).
+- **Prompt templates as registry data (#4)** — `inputType: 'document' | 'query'`
+  resolves the model entry's `templates` (built-in registry or `templates` in
+  config), interpolating `{text}` / `{task}` / `defaults.*` single-pass with
+  `{{`/`}}` escapes. Invalid templates fail at registration. Omitted
+  `inputType` is ALWAYS passthrough (compat contract). Template-less models
+  fall back to the legacy nomic name-regex prefix. Pooling for Qwen3-class
+  models is out of scope here — tracked in #5.
 - **Usage reporting** — backend calls return `embeddingTokens` and
   `latencyMs`, which Harper records in `hdb_model_calls`.
 - **No disposal hook yet** — Harper's registry has no backend dispose

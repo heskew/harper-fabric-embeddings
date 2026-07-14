@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
 	init,
 	embed,
@@ -23,6 +23,9 @@ import {
 	handleApplication,
 	register,
 	EmbeddingEngine,
+	renderTemplate,
+	resolveEngineTemplates,
+	validateTemplates,
 } from '../dist/index.js';
 
 // ─── Unit tests (no model needed) ──────────────────────────────────────────
@@ -249,6 +252,165 @@ describe('register (Harper models backend factory)', () => {
 		await assert.rejects(
 			() => register({ logicalName: 'tiny', kind: 'embedding', config: { modelPath: '/x.gguf', batchSize: 2 } }),
 			/batchSize must be at least 3/
+		);
+	});
+});
+
+// ─── Prompt templates (#4) ──────────────────────────────────────────────────
+
+describe('renderTemplate', () => {
+	it('interpolates {text} and extra placeholders', () => {
+		assert.equal(
+			renderTemplate('Instruct: {task}\nQuery: {text}', { task: 'find docs', text: 'hello' }),
+			'Instruct: find docs\nQuery: hello'
+		);
+	});
+
+	it('renders {{ and }} as literal braces', () => {
+		assert.equal(renderTemplate('{{json}} {text}', { text: 'x' }), '{json} x');
+	});
+
+	it('is single-pass: placeholder values are not re-expanded', () => {
+		assert.equal(
+			renderTemplate('{task} | {text}', { task: 'literal {text} inside', text: 'x' }),
+			'literal {text} inside | x'
+		);
+	});
+
+	it('throws on a placeholder with no value', () => {
+		assert.throws(
+			() => renderTemplate('Instruct: {task}\nQuery: {text}', { text: 'x' }),
+			/No value for template placeholder \{task\}/
+		);
+	});
+
+	it('never resolves prototype properties as placeholder values', () => {
+		assert.throws(() => renderTemplate('{toString} {text}', { text: 'x' }), /No value for template placeholder/);
+	});
+
+	it('renders the built-in nomic templates byte-identically to the legacy prefixes', () => {
+		// Downstream HNSW corpora are stamped against the exact old strings —
+		// one character of drift (trailing space, added newline) silently
+		// invalidates every stored vector.
+		assert.equal(renderTemplate('search_document: {text}', { text: 'hello world' }), 'search_document: hello world');
+		assert.equal(renderTemplate('search_query: {text}', { text: 'hello world' }), 'search_query: hello world');
+		assert.equal(renderTemplate('search_document: {text}', { text: '' }), 'search_document: ');
+	});
+
+	it('inserts replacement-pattern tokens in values literally (function replacer)', () => {
+		assert.equal(renderTemplate('search_document: {text}', { text: "$& $1 $' $$" }), "search_document: $& $1 $' $$");
+	});
+});
+
+describe('resolveEngineTemplates', () => {
+	it('modelName-only construction (the models-backend production path) resolves registry templates', () => {
+		const templates = resolveEngineTemplates({ modelsDir: '/x', modelName: 'nomic-embed-text' });
+		assert.equal(templates.document, 'search_document: {text}');
+		assert.equal(templates.query, 'search_query: {text}');
+	});
+
+	it('defaults to the nomic-embed-text entry when modelName is omitted', () => {
+		const templates = resolveEngineTemplates({ modelsDir: '/x' });
+		assert.equal(templates.document, 'search_document: {text}');
+	});
+
+	it('explicit modelPath without templates resolves none (legacy-fallback territory)', () => {
+		assert.equal(resolveEngineTemplates({ modelPath: '/m.gguf' }), undefined);
+	});
+
+	it('explicit templates win over the registry entry', () => {
+		const templates = resolveEngineTemplates({
+			modelsDir: '/x',
+			modelName: 'nomic-embed-text',
+			templates: { document: 'D {text}' },
+		});
+		assert.equal(templates.document, 'D {text}');
+	});
+});
+
+describe('validateTemplates', () => {
+	it('accepts a Qwen3-style template block', () => {
+		validateTemplates({
+			document: '{text}',
+			query: 'Instruct: {task}\nQuery: {text}',
+			defaults: { task: 'Given a search query, retrieve relevant passages' },
+		});
+	});
+
+	it('rejects an unknown placeholder with no default', () => {
+		assert.throws(() => validateTemplates({ document: '{title} | {text}' }), /\{title\}.*neither/);
+	});
+
+	it('rejects unescaped braces (placeholder typos)', () => {
+		assert.throws(() => validateTemplates({ document: 'search { text }' }), /unescaped/);
+	});
+
+	it("rejects defaults that define 'text'", () => {
+		assert.throws(() => validateTemplates({ document: '{text}', defaults: { text: 'nope' } }), /may not define 'text'/);
+	});
+
+	it('rejects a non-string template side', () => {
+		assert.throws(() => validateTemplates({ document: 42 }), /must be a string/);
+	});
+
+	it('rejects a template that omits {text} (static-prompt typo)', () => {
+		assert.throws(
+			() => validateTemplates({ query: 'Instruct: {task}', defaults: { task: 'retrieve' } }),
+			/must include the \{text\} placeholder/
+		);
+	});
+
+	it('rejects prototype-property placeholder names (no `in`-chain leak)', () => {
+		assert.throws(() => validateTemplates({ query: '{toString} {text}' }), /\{toString\}/);
+	});
+
+	it('rejects unrecognized top-level keys (a typo like documnet would silently unprefix embeds)', () => {
+		assert.throws(
+			() => validateTemplates({ documnet: 'search_document: {text}', query: 'search_query: {text}' }),
+			/unrecognized key 'documnet'/
+		);
+	});
+});
+
+describe('templates at registration', () => {
+	const originalModels = globalThis.models;
+
+	afterEach(() => {
+		if (originalModels === undefined) delete globalThis.models;
+		else globalThis.models = originalModels;
+	});
+
+	function fakeModels() {
+		globalThis.models = {
+			defineBackend(spec) {
+				return spec;
+			},
+			registerBackend() {},
+		};
+	}
+
+	it('accepts a valid templates block in backend config', async () => {
+		fakeModels();
+		await register({
+			logicalName: 'templated',
+			kind: 'embedding',
+			config: {
+				modelPath: '/nonexistent.gguf',
+				templates: { query: 'Instruct: {task}\nQuery: {text}', defaults: { task: 'retrieve' } },
+			},
+		});
+	});
+
+	it('rejects an invalid templates block at registration, not first embed', async () => {
+		fakeModels();
+		await assert.rejects(
+			() =>
+				register({
+					logicalName: 'bad',
+					kind: 'embedding',
+					config: { modelPath: '/nonexistent.gguf', templates: { document: '{unknown} {text}' } },
+				}),
+			/\{unknown\}/
 		);
 	});
 });
@@ -529,6 +691,122 @@ describe('register backend embed (integration)', { skip: !MODEL_PATH }, () => {
 		const controller = new AbortController();
 		controller.abort();
 		await assert.rejects(() => spec.embed('never embedded', { signal: controller.signal }));
+	});
+});
+
+describe('prompt templates (integration)', { skip: !MODEL_PATH }, () => {
+	let engine;
+
+	function cosine(a, b) {
+		let dot = 0;
+		for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+		return dot;
+	}
+
+	before(() => {
+		engine = new EmbeddingEngine({
+			modelPath: MODEL_PATH,
+			addonPath: ADDON_PATH,
+			threads: 4,
+			templates: {
+				query: 'Instruct: {task}\nQuery: {text}',
+				defaults: { task: 'retrieve relevant passages' },
+			},
+		});
+	});
+
+	after(async () => {
+		if (engine) await engine.dispose();
+	});
+
+	it('a query template with a default task shifts the vector vs passthrough', async () => {
+		const text = 'sailing ships across the ocean';
+		const {
+			vectors: [plain],
+		} = await engine.embedMany([text]);
+		const {
+			vectors: [templated],
+		} = await engine.embedMany([text], { inputType: 'query' });
+		assert.ok(cosine(plain, templated) < 0.999, 'expected the template to change the embedding');
+	});
+
+	it('a per-call task overrides the default (distinct vectors)', async () => {
+		const text = 'sailing ships across the ocean';
+		const {
+			vectors: [byDefault],
+		} = await engine.embedMany([text], { inputType: 'query' });
+		const {
+			vectors: [byTask],
+		} = await engine.embedMany([text], { inputType: 'query', task: 'classify the sentiment of the passage' });
+		assert.ok(cosine(byDefault, byTask) < 0.999, 'expected the task override to change the embedding');
+	});
+
+	it('omitted inputType is passthrough even with templates declared (compat contract)', async () => {
+		const text = 'byte identical passthrough check';
+		const plainEngine = new EmbeddingEngine({ modelPath: MODEL_PATH, addonPath: ADDON_PATH, threads: 4 });
+		try {
+			const {
+				vectors: [withTemplates],
+			} = await engine.embedMany([text]);
+			const {
+				vectors: [without],
+			} = await plainEngine.embedMany([text]);
+			assert.ok(cosine(withTemplates, without) > 0.99999, 'expected identical embeddings for omitted inputType');
+		} finally {
+			await plainEngine.dispose();
+		}
+	});
+
+	it('modelName construction (production path) applies registry templates equal to manual prefixing', async () => {
+		// The models-backend config constructs via modelName in production —
+		// this is the registry-template branch every other test bypasses via
+		// modelPath. Registry-templated document embed must match embedding the
+		// hand-prefixed legacy string through passthrough.
+		const registryEngine = new EmbeddingEngine({
+			modelsDir: dirname(MODEL_PATH),
+			modelName: 'nomic-embed-text',
+			addonPath: ADDON_PATH,
+			threads: 4,
+		});
+		try {
+			const text = 'registry template production path';
+			const {
+				vectors: [viaRegistry],
+			} = await registryEngine.embedMany([text], { inputType: 'document' });
+			const {
+				vectors: [viaManual],
+			} = await registryEngine.embedMany([`search_document: ${text}`]);
+			assert.ok(
+				cosine(viaRegistry, viaManual) > 0.9999,
+				'registry-template output should match the hand-prefixed legacy string'
+			);
+		} finally {
+			await registryEngine.dispose();
+		}
+	});
+
+	it('an unrecognized inputType is passthrough, not a crash', async () => {
+		const text = 'unrecognized input type check';
+		const {
+			vectors: [plain],
+		} = await engine.embedMany([text]);
+		const {
+			vectors: [weird],
+		} = await engine.embedMany([text], { inputType: 'toString' });
+		assert.ok(cosine(plain, weird) > 0.99999, 'expected passthrough for an unrecognized inputType');
+	});
+
+	it('a document side without a template falls through to the legacy nomic prefix', async () => {
+		// engine's templates declare only `query`; MODEL_PATH is a nomic file, so
+		// inputType: 'document' should hit the name-regex fallback and differ from passthrough.
+		const text = 'fallback check for the document side';
+		const {
+			vectors: [plain],
+		} = await engine.embedMany([text]);
+		const {
+			vectors: [doc],
+		} = await engine.embedMany([text], { inputType: 'document' });
+		assert.ok(cosine(plain, doc) < 0.999, 'expected the legacy prefix fallback to apply');
 	});
 });
 

@@ -21,8 +21,8 @@
 import path from 'node:path';
 import { EmbeddingEngine, type EngineOptions } from './engine.js';
 
-export { EmbeddingEngine, downloadModel } from './engine.js';
-export type { EngineOptions, EmbedManyOptions, EmbedManyResult } from './engine.js';
+export { EmbeddingEngine, downloadModel, renderTemplate, resolveEngineTemplates, validateTemplates } from './engine.js';
+export type { EngineOptions, EmbedManyOptions, EmbedManyResult, EmbedTemplates } from './engine.js';
 
 /** Options for `init()`. Same shape as `EngineOptions`. */
 export type InitOptions = EngineOptions;
@@ -151,6 +151,7 @@ export async function handleApplication(scope: {
 			threads: toFiniteNumber(opts.threads, 'threads'),
 			gpuLayers: toFiniteNumber(opts.gpuLayers, 'gpuLayers'),
 			addonPath: opts.addonPath as string | undefined,
+			templates: opts.templates as EngineOptions['templates'],
 		};
 	}
 
@@ -187,9 +188,15 @@ export interface RegisterArgs {
 	config: Record<string, unknown>;
 }
 
-/** Per-call options Harper's models facade hands the backend (the subset we use). */
+/**
+ * Per-call options Harper's models facade hands the backend (the subset we use).
+ * `task` rides through because the facade spreads caller opts into BackendOpts
+ * (only `model` is stripped — it's routing-only); it isn't on core's EmbedOpts
+ * TS surface yet, so typed callers cast until core widens it.
+ */
 interface BackendEmbedOpts {
 	inputType?: 'document' | 'query';
+	task?: string;
 	signal?: AbortSignal;
 }
 
@@ -265,6 +272,7 @@ export async function register({ logicalName, kind, config }: RegisterArgs): Pro
 				const started = performance.now();
 				const { vectors, tokens } = await engine.embedMany(texts, {
 					inputType: opts?.inputType,
+					task: opts?.task,
 					signal: opts?.signal,
 				});
 				return {
@@ -294,6 +302,9 @@ function engineOptionsFromConfig(config: Record<string, unknown>): EngineOptions
 		threads: toFiniteNumber(c.threads, 'threads'),
 		gpuLayers: toFiniteNumber(c.gpuLayers, 'gpuLayers'),
 		addonPath: c.addonPath as string | undefined,
+		// Shape-validated by the engine constructor, so a bad block fails at
+		// registration (Harper logs + skips the entry at boot).
+		templates: c.templates as EngineOptions['templates'],
 	};
 }
 
