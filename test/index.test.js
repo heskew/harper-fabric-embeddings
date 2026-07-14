@@ -406,6 +406,50 @@ describe('download lock recovery', () => {
 		}
 	});
 
+	it('sends an HF token as a bearer when the env var is set, none otherwise', async () => {
+		const savedToken = process.env.HF_TOKEN;
+		const savedHub = process.env.HUGGING_FACE_HUB_TOKEN;
+		const seen = [];
+		globalThis.fetch = async (url, init) => {
+			seen.push(init?.headers?.authorization);
+			return new Response('fake-model-bytes');
+		};
+		const dir1 = mkdtempSync(join(tmpdir(), 'hfe-test-'));
+		const dir2 = mkdtempSync(join(tmpdir(), 'hfe-test-'));
+		try {
+			// Clear the fallback var too, or a developer machine that exports it
+			// makes the no-token half of this test fail spuriously.
+			delete process.env.HUGGING_FACE_HUB_TOKEN;
+			process.env.HF_TOKEN = 'hf_unit_test_token';
+			await downloadModel(dir1, 'nomic-embed-text');
+			delete process.env.HF_TOKEN;
+			await downloadModel(dir2, 'nomic-embed-text');
+			assert.deepEqual(seen, ['Bearer hf_unit_test_token', undefined]);
+		} finally {
+			if (savedToken === undefined) delete process.env.HF_TOKEN;
+			else process.env.HF_TOKEN = savedToken;
+			if (savedHub !== undefined) process.env.HUGGING_FACE_HUB_TOKEN = savedHub;
+			await rm(dir1, { recursive: true });
+			await rm(dir2, { recursive: true });
+		}
+	});
+
+	it('a 403 without a token hints at HF_TOKEN', async () => {
+		const savedToken = process.env.HF_TOKEN;
+		const savedHub = process.env.HUGGING_FACE_HUB_TOKEN;
+		globalThis.fetch = async () => new Response('denied', { status: 403, statusText: 'Forbidden' });
+		const dir = mkdtempSync(join(tmpdir(), 'hfe-test-'));
+		try {
+			delete process.env.HF_TOKEN;
+			delete process.env.HUGGING_FACE_HUB_TOKEN;
+			await assert.rejects(() => downloadModel(dir, 'nomic-embed-text'), /403.*set HF_TOKEN/s);
+		} finally {
+			if (savedToken !== undefined) process.env.HF_TOKEN = savedToken;
+			if (savedHub !== undefined) process.env.HUGGING_FACE_HUB_TOKEN = savedHub;
+			await rm(dir, { recursive: true });
+		}
+	});
+
 	it('a waiting worker takes over when the downloader fails without producing a file', async () => {
 		const dir = mkdtempSync(join(tmpdir(), 'hfe-test-'));
 		try {
