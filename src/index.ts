@@ -21,8 +21,15 @@
 import path from 'node:path';
 import { EmbeddingEngine, type EngineOptions } from './engine.js';
 
-export { EmbeddingEngine, downloadModel, renderTemplate, resolveEngineTemplates, validateTemplates } from './engine.js';
-export type { EngineOptions, EmbedManyOptions, EmbedManyResult, EmbedTemplates } from './engine.js';
+export {
+	EmbeddingEngine,
+	decodeAndEmbed,
+	downloadModel,
+	renderTemplate,
+	resolveEngineTemplates,
+	validateTemplates,
+} from './engine.js';
+export type { EngineOptions, EmbedManyOptions, EmbedManyResult, EmbedTemplates, LlamaContext } from './engine.js';
 
 /** Options for `init()`. Same shape as `EngineOptions`. */
 export type InitOptions = EngineOptions;

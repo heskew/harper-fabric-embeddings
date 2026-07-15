@@ -23,6 +23,7 @@ import {
 	handleApplication,
 	register,
 	EmbeddingEngine,
+	decodeAndEmbed,
 	renderTemplate,
 	resolveEngineTemplates,
 	validateTemplates,
@@ -420,6 +421,103 @@ describe('EmbeddingEngine dispose', () => {
 		const engine = new EmbeddingEngine({ modelPath: '/nonexistent.gguf' });
 		await engine.dispose();
 		await assert.rejects(() => engine.embedMany(['hello']), /disposed/);
+	});
+});
+
+// ─── decodeAndEmbed / KV-cache clearing between decodes (issue #8) ─────────
+
+describe('decodeAndEmbed', () => {
+	// Fake LlamaContext double matching the shape engine.ts declares for the
+	// native AddonContext binding (initBatch/addToBatch/decodeBatch/
+	// getEmbedding/disposeSequence). Records call order so tests can assert
+	// the KV-cache eviction actually happens before EACH decode, not just
+	// that decoding still "works" on a happy path.
+	function fakeContext() {
+		const calls = [];
+		return {
+			calls,
+			disposeSequence(seq) {
+				calls.push({ op: 'disposeSequence', seq });
+			},
+			initBatch(size) {
+				calls.push({ op: 'initBatch', size });
+			},
+			addToBatch(seq, pos, tokens) {
+				calls.push({ op: 'addToBatch', seq, pos, tokenCount: tokens.length });
+			},
+			async decodeBatch() {
+				calls.push({ op: 'decodeBatch' });
+			},
+			getEmbedding(tokenCount) {
+				calls.push({ op: 'getEmbedding', tokenCount });
+				return Float64Array.from({ length: 4 }, (_, i) => i + 1);
+			},
+		};
+	}
+
+	it('clears the KV cache (disposeSequence(0)) before every decode, including the second one on the same context', async () => {
+		const ctx = fakeContext();
+		await decodeAndEmbed(ctx, Uint32Array.from([1, 2, 3]));
+		await decodeAndEmbed(ctx, Uint32Array.from([4, 5]));
+
+		const disposeCalls = ctx.calls.filter((c) => c.op === 'disposeSequence');
+		assert.equal(disposeCalls.length, 2, 'expected disposeSequence(0) once per decode, not just once up front');
+		assert.deepEqual(
+			disposeCalls.map((c) => c.seq),
+			[0, 0]
+		);
+
+		// A clear that only ran before the FIRST call would still leave the
+		// second decode's stale cache in place — the exact bug in #8. Assert the
+		// second disposeSequence lands strictly between the two addToBatch calls.
+		const ops = ctx.calls.map((c) => c.op);
+		const firstAddToBatch = ops.indexOf('addToBatch');
+		const secondAddToBatch = ops.indexOf('addToBatch', firstAddToBatch + 1);
+		const firstDispose = ops.indexOf('disposeSequence');
+		const secondDispose = ops.indexOf('disposeSequence', firstDispose + 1);
+		assert.ok(firstDispose < firstAddToBatch, 'first disposeSequence must precede first addToBatch');
+		assert.ok(secondDispose > firstAddToBatch, 'second disposeSequence must run after the first decode');
+		assert.ok(secondDispose < secondAddToBatch, 'second disposeSequence must precede second addToBatch');
+	});
+
+	it('always decodes at seq=0, pos=0 (single-sequence context contract — #embedOne never advances position)', async () => {
+		const ctx = fakeContext();
+		await decodeAndEmbed(ctx, Uint32Array.from([7, 8]));
+		await decodeAndEmbed(ctx, Uint32Array.from([9]));
+
+		const addToBatchCalls = ctx.calls.filter((c) => c.op === 'addToBatch');
+		assert.deepEqual(
+			addToBatchCalls.map((c) => [c.seq, c.pos]),
+			[
+				[0, 0],
+				[0, 0],
+			]
+		);
+	});
+
+	it('propagates a failed cache eviction instead of silently decoding over stale KV-cache state', async () => {
+		const ctx = fakeContext();
+		ctx.disposeSequence = () => {
+			// Mirrors the real AddonContext::DisposeSequence: throws synchronously
+			// (not a rejected promise) when the native llama_memory_seq_rm call fails.
+			throw new Error('Failed to dispose sequence');
+		};
+		await assert.rejects(() => decodeAndEmbed(ctx, Uint32Array.from([1])), /Failed to dispose sequence/);
+	});
+
+	it('returns an L2-normalized vector built from the context embedding', async () => {
+		const ctx = {
+			disposeSequence() {},
+			initBatch() {},
+			addToBatch() {},
+			async decodeBatch() {},
+			getEmbedding: () => Float64Array.from([3, 4]), // magnitude 5
+		};
+		const { vector, tokens } = await decodeAndEmbed(ctx, Uint32Array.from([1, 2, 3]));
+		assert.equal(tokens, 3);
+		assert.ok(Math.abs(Math.hypot(...vector) - 1) < 1e-6, 'expected a unit vector');
+		assert.ok(Math.abs(vector[0] - 0.6) < 1e-6);
+		assert.ok(Math.abs(vector[1] - 0.8) < 1e-6);
 	});
 });
 
@@ -821,5 +919,84 @@ describe('engine dispose during in-flight embed (integration)', { skip: !MODEL_P
 		assert.equal(result.vectors.length, 2);
 		await disposal;
 		await assert.rejects(() => engine.embedMany(['after dispose']), /disposed/);
+	});
+});
+
+// A second (or third) decode on the same EmbeddingEngine instance is exactly
+// the repro from issue #8: pre-fix, #embedOne always decoded seq=0/pos=0
+// without evicting the prior decode's KV-cache cells, so the SECOND decode on
+// one instance hard-aborted the host process (not a thrown/catchable error —
+// these tests would kill the `node --test` worker outright pre-fix, not fail
+// an assertion).
+//
+// One shared `engine` for the repro assertions (rather than a fresh instance
+// per `it`) so this describe block: (a) mirrors the real repro shape — many
+// decodes accumulating on ONE instance, not just two, and (b) keeps this
+// suite's total native-context count low. Constructing a `llama_context` is
+// process-wide state on the Metal backend (see the module doc comment on
+// `acquireBinding`); a separate, unrelated resource-exhaustion bug in
+// node-llama-cpp's Metal backend (`GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS)`
+// in ggml-backend.cpp, hit after ~8 `AddonContext` constructions in one
+// process — the same "Metal-backend-leak on repeated engine construction"
+// noted in the #5 probe script) means stacking many *additional* real
+// contexts onto an already-long integration suite can abort for a reason
+// that has nothing to do with issue #8. Not fixed here — orthogonal, Mac/
+// Metal-only, and CI runs Linux (no Metal backend), so it doesn't gate CI.
+describe('sequential embeds on one engine instance (issue #8 repro)', { skip: !MODEL_PATH }, () => {
+	let engine;
+
+	before(() => {
+		engine = new EmbeddingEngine({ modelPath: MODEL_PATH, addonPath: ADDON_PATH, threads: 4 });
+	});
+
+	after(async () => {
+		if (engine) await engine.dispose();
+	});
+
+	it('embeds 3 texts sequentially via one embedMany([a, b, c]) call without aborting', async () => {
+		const { vectors } = await engine.embedMany(['first text', 'second text', 'third text']);
+		assert.equal(vectors.length, 3);
+		for (const vec of vectors) {
+			assert.ok(vec.length > 0, 'expected a non-empty vector');
+			const mag = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
+			assert.ok(Math.abs(mag - 1.0) < 0.01, `expected unit vector, magnitude = ${mag}`);
+		}
+	});
+
+	it('two SEPARATE embedMany([single]) calls back-to-back on the same instance do not abort', async () => {
+		// The other #8 repro shape: two separate embedMany() calls on the same
+		// engine (not one call with multiple texts) — this hard-aborted the host
+		// process pre-fix. `engine` already carries 3 prior decodes into this test.
+		const first = await engine.embedMany(['fourth text']);
+		const second = await engine.embedMany(['fifth text']);
+		assert.equal(first.vectors.length, 1);
+		assert.equal(second.vectors.length, 1);
+		assert.ok(first.vectors[0].length > 0);
+		assert.ok(second.vectors[0].length > 0);
+	});
+
+	it('an embed on this (already 5-decodes-deep) instance is byte-identical to a fresh single-embed engine', async () => {
+		// Guards against a fix that stops the abort but silently corrupts later
+		// decodes' output (wrong sequence cleared, or an over-eager clear that
+		// also wipes something it shouldn't). A vector produced on the shared,
+		// heavily-reused `engine` must match a brand-new engine's vector for the
+		// same text.
+		const text = 'sailing ships across the ocean';
+		const {
+			vectors: [reused],
+		} = await engine.embedMany([text]);
+
+		const fresh = new EmbeddingEngine({ modelPath: MODEL_PATH, addonPath: ADDON_PATH, threads: 4 });
+		try {
+			const {
+				vectors: [single],
+			} = await fresh.embedMany([text]);
+			assert.equal(reused.length, single.length);
+			let dot = 0;
+			for (let i = 0; i < reused.length; i++) dot += reused[i] * single[i];
+			assert.ok(dot > 0.99999, `expected byte-identical (cosine ~1.0) vectors, got cosine = ${dot}`);
+		} finally {
+			await fresh.dispose();
+		}
 	});
 });
