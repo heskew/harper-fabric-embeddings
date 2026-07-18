@@ -30,6 +30,5 @@ jobs:
 
       - run: sfw npm install
 
-      - run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # OIDC trusted publisher (stage-only): stages the version for 2FA approval on npmjs.com
+      - run: npm stage publish

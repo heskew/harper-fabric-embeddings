@@ -34,7 +34,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/heskew/harper-fabric-embeddings"
+		"url": "git+https://github.com/heskew/harper-fabric-embeddings.git"
 	},
 	"devDependencies": {
 		"@harperdb/code-guidelines": "^0.0.6",
