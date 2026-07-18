@@ -140,14 +140,25 @@ interface LlamaModel {
 	getEmbeddingVectorSize(): number;
 }
 
-/** Native embedding context handle. */
-interface LlamaContext {
+/**
+ * Native embedding context handle. Exported because `decodeAndEmbed` — public
+ * so tests can exercise it against a fake — takes one as a parameter;
+ * `declaration: true` requires every type reachable from an exported
+ * signature to itself be exported.
+ */
+export interface LlamaContext {
 	init(): Promise<boolean>;
 	dispose(): Promise<void>;
 	initBatch(size: number): void;
 	addToBatch(seq: number, pos: number, tokens: Uint32Array, logitIndexes: Uint32Array): void;
 	decodeBatch(): Promise<void>;
 	getEmbedding(tokenCount: number): Float32Array;
+	/**
+	 * Evict every KV-cache cell for a sequence (`llama_memory_seq_rm(seq, -1, -1)`
+	 * under the hood). Synchronous; throws if the native eviction fails. A no-op
+	 * on a sequence with no cached cells (e.g. a freshly created context).
+	 */
+	disposeSequence(seq: number): void;
 }
 
 // ─── Model registry ─────────────────────────────────────────────────────────
@@ -498,19 +509,7 @@ export class EmbeddingEngine {
 		}
 
 		const input = this.#buildTokenSequence(tokens);
-		this.#context!.initBatch(input.length);
-
-		const logitIndexes = new Uint32Array(input.length);
-		for (let i = 0; i < input.length; i++) logitIndexes[i] = i;
-
-		this.#context!.addToBatch(0, 0, input, logitIndexes);
-		await this.#context!.decodeBatch();
-
-		// Copy before normalizing — don't assume the addon's returned view stays
-		// stable across the next decode.
-		const vector = Float32Array.from(this.#context!.getEmbedding(input.length));
-		l2NormalizeInPlace(vector);
-		return { vector, tokens: input.length };
+		return decodeAndEmbed(this.#context!, input);
 	}
 
 	/** Build the full token sequence with BOS/EOS markers. */
@@ -531,6 +530,44 @@ export class EmbeddingEngine {
 
 		return new Uint32Array(parts);
 	}
+}
+
+// ─── Single-sequence decode ─────────────────────────────────────────────────
+
+/**
+ * Decode one token sequence against a single-sequence llama.cpp context
+ * (`sequences: 1` — see `#doInit`) and return its L2-normalized embedding.
+ *
+ * Always decodes at `seq=0, pos=0`: there is exactly one KV-cache sequence
+ * slot on the context, reused across every call. `disposeSequence(0)` evicts
+ * whatever cache cells the *previous* call on this context left behind
+ * before writing new cells at pos 0 — without it, a second decode on the
+ * same context sees inconsistent KV-cache/position state at pos 0 and
+ * `llama_decode` hard-aborts the host process (a native `GGML_ASSERT`, not a
+ * catchable JS error). A no-op on a fresh context (issue #8).
+ *
+ * A free function (not a private method) so it can be unit tested against a
+ * fake `LlamaContext` double — the real native context can't be constructed
+ * without a loaded GGUF model.
+ */
+export async function decodeAndEmbed(
+	context: LlamaContext,
+	input: Uint32Array
+): Promise<{ vector: Float32Array; tokens: number }> {
+	context.disposeSequence(0);
+	context.initBatch(input.length);
+
+	const logitIndexes = new Uint32Array(input.length);
+	for (let i = 0; i < input.length; i++) logitIndexes[i] = i;
+
+	context.addToBatch(0, 0, input, logitIndexes);
+	await context.decodeBatch();
+
+	// Copy before normalizing — don't assume the addon's returned view stays
+	// stable across the next decode.
+	const vector = Float32Array.from(context.getEmbedding(input.length));
+	l2NormalizeInPlace(vector);
+	return { vector, tokens: input.length };
 }
 
 // ─── Prompt templates ───────────────────────────────────────────────────────
