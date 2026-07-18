@@ -103,16 +103,24 @@ await dispose();
 
 Initialize the embedding engine. Call once before using `embed()`.
 
-| Option        | Type   | Default              | Description                              |
-| ------------- | ------ | -------------------- | ---------------------------------------- |
-| `modelPath`   | string | —                    | Absolute path to a .gguf model file      |
-| `modelsDir`   | string | —                    | Directory to search/download model files |
-| `modelName`   | string | `"nomic-embed-text"` | Model name from the built-in registry    |
-| `contextSize` | number | `2048`               | Token context window size                |
-| `batchSize`   | number | `512`                | Batch processing size                    |
-| `threads`     | number | `6`                  | CPU threads for inference                |
-| `gpuLayers`   | number | `0`                  | Layers to offload to GPU (0 = CPU only)  |
-| `addonPath`   | string | —                    | Override path to `llama-addon.node`      |
+| Option        | Type   | Default              | Description                                                             |
+| ------------- | ------ | -------------------- | ----------------------------------------------------------------------- |
+| `modelPath`   | string | —                    | Absolute path to a .gguf model file                                     |
+| `modelsDir`   | string | —                    | Directory to search/download model files                                |
+| `modelName`   | string | `"nomic-embed-text"` | Model name from the built-in registry                                   |
+| `contextSize` | number | `2048`               | Token context window size                                               |
+| `batchSize`   | number | `contextSize`        | Batch size (`n_batch`/`n_ubatch`); longer inputs are truncated          |
+| `threads`     | number | `6`                  | CPU threads for inference                                               |
+| `gpuLayers`   | number | `0`                  | Layers to offload to GPU (0 = CPU only)                                 |
+| `addonPath`   | string | —                    | Override path to `llama-addon.node`                                     |
+| `templates`   | object | registry entry       | Per-inputType prompt templates (`document`/`query`/`defaults`)          |
+| `pooling`     | string | —                    | Expected pooling declared by the model file — verified at init, not set |
+
+`pooling` (`'none' | 'mean' | 'cls' | 'last' | 'rank'`) is verification, not
+override: the native addon exposes no pooling option, so llama.cpp always uses
+the model's own `<arch>.pooling_type` metadata. Declaring the expectation makes
+init fail loudly when a GGUF omits or contradicts it — instead of a
+metadata-less conversion silently mean-pooling a last-token model.
 
 Either `modelPath` or `modelsDir` is required.
 

@@ -11,6 +11,7 @@
 
 import { createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { open, rename, unlink } from 'node:fs/promises';
+import { assertDeclaredPooling, POOLING_NAMES, type PoolingName } from './gguf.js';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -79,6 +80,16 @@ export interface EngineOptions {
 	 * legacy nomic name-prefix heuristic.
 	 */
 	templates?: EmbedTemplates;
+	/**
+	 * Expected pooling for this model (`'none' | 'mean' | 'cls' | 'last' |
+	 * 'rank'`). Verification, not override: the native addon exposes no pooling
+	 * option, so the llama.cpp context always uses the model's own
+	 * `<arch>.pooling_type` metadata. Declaring the expectation makes init fail
+	 * loudly when the GGUF omits or contradicts it — the alternative is a
+	 * metadata-less conversion silently mean-pooling a last-token model
+	 * (issue #12). Omitted = accept whatever the model resolves to.
+	 */
+	pooling?: PoolingName;
 }
 
 export interface EmbedManyOptions {
@@ -286,6 +297,9 @@ export class EmbeddingEngine {
 		if (effectiveBatchSize < 3) {
 			throw new Error(`batchSize must be at least 3 (one body token plus BOS/EOS), got ${effectiveBatchSize}`);
 		}
+		if (options.pooling !== undefined && !POOLING_NAMES.includes(options.pooling)) {
+			throw new Error(`Unknown pooling '${String(options.pooling)}' (expected one of: ${POOLING_NAMES.join(', ')})`);
+		}
 		this.#options = options;
 		this.#modelIdentity = options.modelPath ? path.basename(options.modelPath) : modelName;
 		const templates = resolveEngineTemplates(options);
@@ -340,6 +354,13 @@ export class EmbeddingEngine {
 			modelPath = await resolveModelPath(modelsDir!, modelName);
 		}
 		if (!existsSync(modelPath)) throw new Error(`Model file not found: ${modelPath}`);
+
+		// Same principle as resolving the model first: verify pooling before the
+		// addon is touched, so a wrong-pooling model never churns the binding
+		// refcount or pays a model load just to be rejected.
+		if (this.#options.pooling) {
+			await assertDeclaredPooling(modelPath, this.#options.pooling);
+		}
 
 		const resolvedAddonPath = addonPath || findAddonBinary();
 		const binding = await acquireBinding(resolvedAddonPath);

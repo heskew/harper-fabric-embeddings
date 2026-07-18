@@ -27,6 +27,8 @@ import {
 	renderTemplate,
 	resolveEngineTemplates,
 	validateTemplates,
+	readGgufPooling,
+	assertDeclaredPooling,
 } from '../dist/index.js';
 
 // ─── Unit tests (no model needed) ──────────────────────────────────────────
@@ -998,5 +1000,126 @@ describe('sequential embeds on one engine instance (issue #8 repro)', { skip: !M
 		} finally {
 			await fresh.dispose();
 		}
+	});
+});
+
+// ─── GGUF pooling verification (issue #12) ─────────────────────────────────
+
+describe('gguf pooling verification', () => {
+	// Synthetic GGUF builders — header + metadata KVs per the GGUF v3 spec.
+	const u32 = (n) => {
+		const b = Buffer.alloc(4);
+		b.writeUInt32LE(n);
+		return b;
+	};
+	const u64 = (n) => {
+		const b = Buffer.alloc(8);
+		b.writeBigUInt64LE(BigInt(n));
+		return b;
+	};
+	const str = (s) => {
+		const body = Buffer.from(s, 'utf8');
+		return Buffer.concat([u64(body.length), body]);
+	};
+	const kvStr = (key, value) => Buffer.concat([str(key), u32(8), str(value)]);
+	const kvU32 = (key, value) => Buffer.concat([str(key), u32(4), u32(value)]);
+	const kvI32 = (key, value) => {
+		const b = Buffer.alloc(4);
+		b.writeInt32LE(value);
+		return Buffer.concat([str(key), u32(5), b]);
+	};
+	const kvF32 = (key, value) => {
+		const b = Buffer.alloc(4);
+		b.writeFloatLE(value);
+		return Buffer.concat([str(key), u32(6), b]);
+	};
+	const kvBool = (key, value) => Buffer.concat([str(key), u32(7), Buffer.from([value ? 1 : 0])]);
+	const kvStrArray = (key, values) =>
+		Buffer.concat([str(key), u32(9), u32(8), u64(values.length), ...values.map((v) => str(v))]);
+	const kvU32Array = (key, values) =>
+		Buffer.concat([str(key), u32(9), u32(4), u64(values.length), ...values.map((v) => u32(v))]);
+	const buildGguf = (kvs, { magic = 0x46554747, version = 3 } = {}) =>
+		Buffer.concat([u32(magic), u32(version), u64(0), u64(kvs.length), ...kvs]);
+
+	let dir;
+	before(() => {
+		dir = mkdtempSync(join(tmpdir(), 'hfe-gguf-'));
+	});
+	after(async () => {
+		await rm(dir, { recursive: true, force: true });
+	});
+	const write = (name, buffer) => {
+		const p = join(dir, name);
+		writeFileSync(p, buffer);
+		return p;
+	};
+
+	it('reads architecture and pooling_type', async () => {
+		const p = write('qwen3.gguf', buildGguf([kvStr('general.architecture', 'qwen3'), kvU32('qwen3.pooling_type', 3)]));
+		assert.deepEqual(await readGgufPooling(p), { architecture: 'qwen3', poolingType: 3 });
+	});
+
+	it('matches the pooling key by suffix regardless of key order', async () => {
+		const p = write('order.gguf', buildGguf([kvU32('bert.pooling_type', 1), kvStr('general.architecture', 'bert')]));
+		assert.deepEqual(await readGgufPooling(p), { architecture: 'bert', poolingType: 1 });
+	});
+
+	it('skips unrelated values of every shape, including tokenizer-style string arrays', async () => {
+		const p = write(
+			'noisy.gguf',
+			buildGguf([
+				kvStr('general.name', 'test model'),
+				kvF32('bert.rope.freq_base', 10000),
+				kvBool('bert.attention.causal', false),
+				kvStrArray('tokenizer.ggml.tokens', ['<s>', '</s>', 'hello', 'world', 'éé']),
+				kvU32Array('bert.layer_sizes', [768, 768, 768]),
+				kvStr('general.architecture', 'bert'),
+				kvI32('bert.pooling_type', 2),
+			])
+		);
+		assert.deepEqual(await readGgufPooling(p), { architecture: 'bert', poolingType: 2 });
+	});
+
+	it('reports absent pooling metadata as undefined, not an error', async () => {
+		const p = write('bare.gguf', buildGguf([kvStr('general.architecture', 'bert')]));
+		assert.deepEqual(await readGgufPooling(p), { architecture: 'bert' });
+	});
+
+	it('rejects a non-GGUF file', async () => {
+		const p = write('bad.gguf', buildGguf([], { magic: 0xdeadbeef }));
+		await assert.rejects(() => readGgufPooling(p), /Not a GGUF file/);
+	});
+
+	it('rejects unsupported GGUF versions', async () => {
+		const p = write('v1.gguf', buildGguf([], { version: 1 }));
+		await assert.rejects(() => readGgufPooling(p), /Unsupported GGUF version 1/);
+	});
+
+	it('rejects a truncated file', async () => {
+		const whole = buildGguf([kvStr('general.architecture', 'qwen3'), kvU32('qwen3.pooling_type', 3)]);
+		const p = write('truncated.gguf', whole.subarray(0, whole.length - 6));
+		await assert.rejects(() => readGgufPooling(p), /Unexpected end of file/);
+	});
+
+	it('assertDeclaredPooling passes on a match', async () => {
+		const p = write('match.gguf', buildGguf([kvStr('general.architecture', 'qwen3'), kvU32('qwen3.pooling_type', 3)]));
+		await assertDeclaredPooling(p, 'last');
+	});
+
+	it('assertDeclaredPooling names both sides on a mismatch', async () => {
+		const p = write('mismatch.gguf', buildGguf([kvStr('general.architecture', 'bert'), kvU32('bert.pooling_type', 1)]));
+		await assert.rejects(() => assertDeclaredPooling(p, 'last'), /declares pooling 'mean'.*expects 'last'/);
+	});
+
+	it('assertDeclaredPooling fails loudly when the model declares nothing', async () => {
+		const p = write('undeclared.gguf', buildGguf([kvStr('general.architecture', 'bert')]));
+		await assert.rejects(() => assertDeclaredPooling(p, 'last'), /declares no bert\.pooling_type/);
+	});
+
+	it('engine constructor rejects a pooling typo at registration time', () => {
+		assert.throws(
+			() => new EmbeddingEngine({ modelPath: '/nonexistent.gguf', pooling: 'means' }),
+			/Unknown pooling 'means'/
+		);
 	});
 });
