@@ -30,6 +30,8 @@ export {
 	validateTemplates,
 } from './engine.js';
 export type { EngineOptions, EmbedManyOptions, EmbedManyResult, EmbedTemplates, LlamaContext } from './engine.js';
+export { assertDeclaredPooling, readGgufPooling, POOLING_NAMES } from './gguf.js';
+export type { GgufPoolingInfo, PoolingName } from './gguf.js';
 
 /** Options for `init()`. Same shape as `EngineOptions`. */
 export type InitOptions = EngineOptions;
@@ -132,6 +134,7 @@ export async function dispose(): Promise<void> {
  *   threads     — CPU threads for inference
  *   gpuLayers   — layers to offload to GPU (0 = CPU only)
  *   addonPath   — override path to llama-addon.node
+ *   pooling     — expected pooling declared by the model file (verified at init)
  */
 export async function handleApplication(scope: {
 	directory: string;
@@ -159,6 +162,7 @@ export async function handleApplication(scope: {
 			gpuLayers: toFiniteNumber(opts.gpuLayers, 'gpuLayers'),
 			addonPath: opts.addonPath as string | undefined,
 			templates: opts.templates as EngineOptions['templates'],
+			pooling: opts.pooling as EngineOptions['pooling'],
 		};
 	}
 
@@ -312,6 +316,7 @@ function engineOptionsFromConfig(config: Record<string, unknown>): EngineOptions
 		// Shape-validated by the engine constructor, so a bad block fails at
 		// registration (Harper logs + skips the entry at boot).
 		templates: c.templates as EngineOptions['templates'],
+		pooling: c.pooling as EngineOptions['pooling'],
 	};
 }
 

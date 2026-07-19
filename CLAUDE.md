@@ -20,7 +20,8 @@ Published as `harper-fabric-embeddings` on npm. Used by `harper-kb` as an option
 harper-fabric-embeddings
 ├── src/
 │   ├── index.ts   ← Public API: raw init/embed, handleApplication, register factory
-│   └── engine.ts  ← EmbeddingEngine class, shared addon binding registry, model download
+│   ├── engine.ts  ← EmbeddingEngine class, shared addon binding registry, model download
+│   └── gguf.ts    ← Minimal GGUF header reader for pooling verification (issue #12)
 ├── dist/          ← Compiled output (gitignored)
 ├── test/
 │   └── index.test.js ← Node.js built-in test runner (plain JS, imports dist)
@@ -64,6 +65,7 @@ await dispose();
 | `threads`     | number | `6`                  | CPU threads for inference                                                                                                                                                              |
 | `gpuLayers`   | number | `0`                  | Layers to offload to GPU (0 = CPU only)                                                                                                                                                |
 | `addonPath`   | string | —                    | Override path to `llama-addon.node`                                                                                                                                                    |
+| `pooling`     | string | —                    | Expected pooling (`none`/`mean`/`cls`/`last`/`rank`) — verified against GGUF `<arch>.pooling_type` at init; fails loudly if absent/different. The addon cannot override model pooling. |
 
 Either `modelPath` or `modelsDir` is required.
 
