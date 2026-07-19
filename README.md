@@ -191,6 +191,28 @@ HuggingFace may reject anonymous large-file downloads (HTTP 403). Set
 download sends it as a bearer; alternatively pre-seed `modelsDir` with the
 model file and no download happens at all.
 
+## Vector reproducibility
+
+Embedding vectors are bit-reproducible only within a **fixed environment**:
+the same model file, platform binary (Metal and linux-x64 kernels differ),
+`threads`, and `batchSize`. Across environments, expect relative component
+differences on the order of f32 epsilon (~1e-7) on identical inputs — ggml's
+accumulation order varies with all of the above. Cosine deltas stay far below
+1e-6 and are not observable in recall metrics.
+
+Practical consequences:
+
+- Don't build re-embed detection or vector-stamp identity on vector bytes (or
+  hashes of them) compared across machines or configs — epsilon drift will
+  read as a model change. Stamp on metadata instead: model file hash, package
+  version, template config.
+- A corpus embedded on one platform is fully usable for search from another;
+  the drift is orders of magnitude below quantization noise.
+- Version-to-version, this package's own math is stable — output is unchanged
+  from 0.2.3 through 0.5.0 (verified bit-level in
+  [#10](https://github.com/heskew/harper-fabric-embeddings/issues/10)). If an
+  output-affecting change ever ships, the release notes will say so explicitly.
+
 ## Testing
 
 ```sh
