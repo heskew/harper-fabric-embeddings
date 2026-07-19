@@ -4,8 +4,8 @@
  * `EmbeddingEngine` owns one GGUF model + llama.cpp context and serializes
  * embed calls against it. Multiple engines can coexist in one process — one
  * per registered Harper model entry — so the native addon binding is shared
- * through a refcounted registry keyed by addon path (dlopen of the same path
- * returns the same handle; llama.cpp keeps all state in heap objects, so
+ * through a process-resident registry keyed by addon path (dlopen of the same
+ * path returns the same handle; llama.cpp keeps all state in heap objects, so
  * engines stay independent through the shared native code).
  */
 
@@ -183,46 +183,29 @@ const MODELS: Record<string, ModelConfig> = {
 
 // ─── Shared native binding registry ─────────────────────────────────────────
 
-interface BindingEntry {
-	promise: Promise<LlamaBinding>;
-	refs: number;
-}
-
-// One dlopen + backend load per addon path, shared across engines. Refcounted
-// so the last engine's dispose() tears the addon down (matching the pre-engine
-// module behavior); a failed load is evicted so the next acquire retries.
-//
-// Not atomic across the dispose await: an acquire racing the final release can
-// dlopen a handle the in-flight dispose is tearing down. Accepted — it needs
-// two engines on one addon path with one disposing while the other inits, and
-// the models-backend path never disposes engines today.
-const bindings = new Map<string, BindingEntry>();
+// One dlopen + backend load per addon path, shared across engines and resident
+// for the life of the process. Never torn down: dlopen dedups by path, so a
+// "fresh" load after a teardown gets the SAME native module back — and
+// re-running init()/loadBackends() re-registers backend devices in ggml's
+// global registry without unregistering the old entries. ggml_backend_sched_new
+// asserts n_backends <= GGML_SCHED_MAX_BACKENDS (16), so ~7 construct/dispose
+// cycles abort the host process on Metal (issue #9). Engines still free their
+// own model + context in dispose(); the addon handle and its one-time backend
+// registrations are process-lifetime. A failed load is evicted so the next
+// acquire retries.
+const bindings = new Map<string, Promise<LlamaBinding>>();
 
 function acquireBinding(addonPath: string): Promise<LlamaBinding> {
-	let entry = bindings.get(addonPath);
-	if (!entry) {
-		const created: BindingEntry = { refs: 0, promise: loadBinding(addonPath) };
-		created.promise.catch(() => {
+	let promise = bindings.get(addonPath);
+	if (!promise) {
+		const created = loadBinding(addonPath);
+		created.catch(() => {
 			if (bindings.get(addonPath) === created) bindings.delete(addonPath);
 		});
 		bindings.set(addonPath, created);
-		entry = created;
+		promise = created;
 	}
-	entry.refs++;
-	return entry.promise;
-}
-
-async function releaseBinding(addonPath: string): Promise<void> {
-	const entry = bindings.get(addonPath);
-	if (!entry) return;
-	if (--entry.refs > 0) return;
-	bindings.delete(addonPath);
-	try {
-		const binding = await entry.promise;
-		await binding.dispose();
-	} catch {
-		// Load failed — nothing to dispose.
-	}
+	return promise;
 }
 
 async function loadBinding(addonPath: string): Promise<LlamaBinding> {
@@ -252,7 +235,6 @@ export class EmbeddingEngine {
 	#templates: EmbedTemplates | undefined;
 	#nomicFallback: boolean;
 	#binding: LlamaBinding | null = null;
-	#addonPathUsed: string | null = null;
 	#model: LlamaModel | null = null;
 	#context: LlamaContext | null = null;
 	#bosToken = -1;
@@ -374,13 +356,11 @@ export class EmbeddingEngine {
 		} catch (err) {
 			if (context) await context.dispose().catch(() => {});
 			if (model) await model.dispose().catch(() => {});
-			await releaseBinding(resolvedAddonPath);
 			throw err;
 		}
 
 		// Commit state only after everything succeeds
 		this.#binding = binding;
-		this.#addonPathUsed = resolvedAddonPath;
 		this.#model = model;
 		this.#context = context;
 		this.#bosToken = model.tokenBos();
@@ -443,12 +423,9 @@ export class EmbeddingEngine {
 			await this.#model.dispose();
 			this.#model = null;
 		}
-		if (this.#binding) {
-			this.#binding = null;
-			const addonPath = this.#addonPathUsed;
-			this.#addonPathUsed = null;
-			if (addonPath) await releaseBinding(addonPath);
-		}
+		// The shared addon binding is resident (see the bindings registry) — only
+		// this engine's reference is dropped here.
+		this.#binding = null;
 		this.#bosToken = -1;
 		this.#eosToken = -1;
 		this.#maxInputTokens = 0;
